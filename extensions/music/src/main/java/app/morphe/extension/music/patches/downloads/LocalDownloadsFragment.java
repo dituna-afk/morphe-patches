@@ -72,7 +72,6 @@ import app.morphe.extension.shared.Logger;
 import app.morphe.extension.shared.ResourceUtils;
 import app.morphe.extension.shared.Utils;
 import app.morphe.extension.shared.settings.search.BaseSearchViewController;
-import app.morphe.extension.shared.theme.ThemeUtils;
 import app.morphe.extension.shared.ui.CustomDialog;
 
 @SuppressWarnings("deprecation")
@@ -1623,7 +1622,8 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     private static int secondary() { return Color.argb(180, 230, 230, 240); }
-    private int dp(int val) { return (int) (val * getResources().getDisplayMetrics().density + .5f); }
+    private int dp(int val) { return (int) (val * getResources().getDisplayMetrics().density + 0.5f); }
+    private float dp(float val) { return val * getResources().getDisplayMetrics().density; }
 
     private static String formatDuration(int s) {
         if (s <= 0) return "0:00";
