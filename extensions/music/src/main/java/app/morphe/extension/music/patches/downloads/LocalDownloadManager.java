@@ -20,21 +20,26 @@ import android.os.Environment;
 
 import androidx.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import app.morphe.extension.music.patches.scrobbling.ScrobbleManager;
@@ -50,31 +55,36 @@ import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.VideoDetai
 import app.morphe.extension.shared.requests.Requester;
 import app.morphe.extension.shared.spoof.requests.StreamingDataRequest;
 
-/** Downloads the already resolved InnerTube audio stream without leaving YouTube Music. */
+/** Downloads resolved InnerTube audio streams and auto-downloads entire playlists. */
 public final class LocalDownloadManager {
+
+    public interface DownloadListener {
+        void onDownloadStateChanged(String videoId, boolean completed);
+    }
+
+    private static final Set<DownloadListener> LISTENERS = new CopyOnWriteArraySet<>();
+    private static final ExecutorService PLAYLIST_QUEUE_EXECUTOR = Executors.newSingleThreadExecutor();
 
     private static final String DOWNLOAD_CHANNEL = "morphe_audio_downloads";
     private static final String USER_AGENT =
             "com.google.android.youtube/19.47.53 (Linux; U; Android 14) gzip";
+    private static final String WEB_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-    /** Ranges are fetched in parallel, which is what makes a download finish in seconds. */
     private static final int SEGMENT_COUNT = 4;
     private static final int BUFFER_SIZE = 64 * 1024;
 
-    /**
-     * The system silently drops notifications posted faster than a few per second, which used to
-     * leave stale progress on screen after the download had finished. Updates are spaced out.
-     */
     private static final long NOTIFICATION_INTERVAL_MILLISECONDS = 1000;
     private static final AtomicLong lastNotificationTime = new AtomicLong();
 
     private static final int CONNECT_TIMEOUT_MILLISECONDS = 15_000;
     private static final int READ_TIMEOUT_MILLISECONDS = 30_000;
-
-    /** A range that makes no progress this many times in a row is treated as stalled. */
     private static final int MAX_STALLED_ATTEMPTS = 4;
 
     private static final Pattern VIDEO_ID = Pattern.compile("[A-Za-z0-9_-]{1,20}");
+    private static final Pattern PLAYLIST_PARAM = Pattern.compile("[?&]list=([A-Za-z0-9_-]+)");
+    private static final Pattern JSON_VIDEO_ID = Pattern.compile("\"videoId\":\"([A-Za-z0-9_-]{11})\"");
+    private static final Pattern DIRECT_VIDEO_ID = Pattern.compile("(?:v=|youtu\\.be/|/watch\\?v=)([A-Za-z0-9_-]{11})");
 
     private static final String THUMBNAIL_URL = "https://i.ytimg.com/vi/";
 
@@ -83,18 +93,40 @@ public final class LocalDownloadManager {
     private LocalDownloadManager() {
     }
 
+    public static void addListener(DownloadListener listener) {
+        LISTENERS.add(listener);
+    }
+
+    public static void removeListener(DownloadListener listener) {
+        LISTENERS.remove(listener);
+    }
+
+    public static boolean isDownloading(String videoId) {
+        return ACTIVE_DOWNLOADS.contains(videoId);
+    }
+
+    public static int getActiveDownloadCount() {
+        return ACTIVE_DOWNLOADS.size();
+    }
+
+    private static void notifyListeners(String videoId, boolean completed) {
+        for (DownloadListener listener : LISTENERS) {
+            listener.onDownloadStateChanged(videoId, completed);
+        }
+    }
+
     /** Must be called from the main thread. Resolution and downloading happen in background. */
     public static void enqueue(String videoId) {
-        // Every file of a download is named after the id, so anything that is not a plain id
-        // is refused rather than written under a different name than it is looked up by.
+        enqueue(videoId, null, true);
+    }
+
+    public static void enqueue(String videoId, @Nullable String targetPlaylistName, boolean showToasts) {
         if (!VIDEO_ID.matcher(videoId).matches()) {
             Logger.printDebug(() -> "Refusing to download an unusable id: " + videoId);
-            Utils.showToastShort(str("morphe_music_downloads_unknown_track"));
+            if (showToasts) Utils.showToastShort(str("morphe_music_downloads_unknown_track"));
             return;
         }
 
-        // The scrobbler describes whatever the player is on, so it may only be used for that
-        // track. Any other track is described by the video details of its own player response.
         final boolean isPlayingTrack = videoId.equals(VideoInformation.getVideoId());
         ScrobbleManager metadata = ScrobbleManager.getInstance();
 
@@ -105,42 +137,182 @@ public final class LocalDownloadManager {
         Bitmap artwork = isPlayingTrack ? metadata.getCurrentArtwork() : null;
 
         Utils.submitOnBackgroundThread(() -> {
-            downloadBlocking(videoId, title, artist, album, duration, artwork);
+            downloadBlocking(videoId, title, artist, album, duration, artwork, targetPlaylistName, showToasts);
             return null;
         });
     }
 
-    private static void downloadBlocking(String videoId, String title, String artist, String album,
-                                         int duration, Bitmap artwork) {
-        if (!ACTIVE_DOWNLOADS.add(videoId)) {
-            Utils.showToastShort(str("morphe_music_downloads_already_running"));
+    /**
+     * Automatically checks all playlists (or a specific playlist) and downloads any missing tracks.
+     */
+    public static void syncPlaylists(File musicRoot, @Nullable String playlistName, boolean notifyStart) {
+        PLAYLIST_QUEUE_EXECUTOR.submit(() -> {
+            List<String> missing = OfflineStorage.getMissingVideoIds(musicRoot, playlistName);
+            if (missing.isEmpty()) {
+                if (notifyStart) {
+                    Utils.runOnMainThread(() -> Utils.showToastShort("Listedeki tüm şarkılar zaten indirilmiş"));
+                }
+                return;
+            }
+            if (notifyStart) {
+                Utils.runOnMainThread(() -> Utils.showToastShort(
+                        missing.size() + " şarkı otomatik indirme kuyruğuna alındı"));
+            }
+            for (String videoId : missing) {
+                downloadBlocking(videoId, null, null, null, 0, null, playlistName, false);
+            }
+            if (notifyStart) {
+                Utils.runOnMainThread(() -> Utils.showToastShort("Playlist otomatik indirmesi tamamlandı"));
+            }
+        });
+    }
+
+    /**
+     * Resolves all songs from a YouTube / YouTube Music playlist URL or ID (or list of links)
+     * and automatically downloads every track into the given local playlist.
+     */
+    public static void fetchAndDownloadPlaylist(File musicRoot, String playlistName, String rawInput) {
+        PLAYLIST_QUEUE_EXECUTOR.submit(() -> {
+            try {
+                List<String> resolvedIds = resolvePlaylistOrTrackIds(rawInput);
+                if (resolvedIds.isEmpty()) {
+                    Utils.runOnMainThread(() -> Utils.showToastShort(
+                            "Bağlantıdan şarkı bulunamadı. Geçerli bir Playlist linki/ID girin."));
+                    return;
+                }
+
+                OfflineStorage.createPlaylist(musicRoot, playlistName, rawInput);
+                OfflineStorage.addTracksToPlaylist(musicRoot, playlistName, resolvedIds);
+                notifyListeners("", false);
+
+                Utils.runOnMainThread(() -> Utils.showToastShort(
+                        "\"" + playlistName + "\" listesinde " + resolvedIds.size() + " şarkı bulundu, otomatik indiriliyor..."));
+
+                int count = 0;
+                for (String id : resolvedIds) {
+                    count++;
+                    final int index = count;
+                    showDownloadNotification("playlist_sync_" + playlistName,
+                            playlistName + " (" + index + "/" + resolvedIds.size() + ")",
+                            (index * 100) / resolvedIds.size(),
+                            true,
+                            "Oynatma listesi otomatik indiriliyor...");
+                    downloadBlocking(id, null, null, null, 0, null, playlistName, false);
+                }
+
+                showDownloadNotification("playlist_sync_" + playlistName,
+                        playlistName,
+                        100,
+                        false,
+                        resolvedIds.size() + " şarkı başarıyla indirildi");
+                Utils.runOnMainThread(() -> Utils.showToastShort(
+                        "\"" + playlistName + "\" listesindeki tüm şarkılar indirildi!"));
+            } catch (Exception ex) {
+                Logger.printException(() -> "Playlist auto-download failed: " + rawInput, ex);
+                Utils.runOnMainThread(() -> Utils.showToastShort("Playlist indirilirken hata oluştu"));
+            }
+        });
+    }
+
+    private static List<String> resolvePlaylistOrTrackIds(String input) {
+        Set<String> ids = new LinkedHashSet<>();
+        if (input == null || input.isBlank()) return new ArrayList<>();
+
+        String trimmed = input.trim();
+
+        // 1. Check if it contains a playlist ID (list=... or starts with PL / VL / OLAK / RD)
+        String listId = null;
+        Matcher listMatcher = PLAYLIST_PARAM.matcher(trimmed);
+        if (listMatcher.find()) {
+            listId = listMatcher.group(1);
+        } else if (trimmed.startsWith("VLPL") && trimmed.length() > 4) {
+            listId = trimmed.substring(2);
+        } else if ((trimmed.startsWith("PL") || trimmed.startsWith("OLAK") || trimmed.startsWith("RD"))
+                && !trimmed.contains(" ") && trimmed.length() >= 10) {
+            listId = trimmed;
+        }
+
+        if (listId != null) {
+            try {
+                String url = "https://www.youtube.com/playlist?list=" + listId + "&hl=en";
+                HttpURLConnection conn = Requester.openConnection(url);
+                conn.setConnectTimeout(CONNECT_TIMEOUT_MILLISECONDS);
+                conn.setReadTimeout(READ_TIMEOUT_MILLISECONDS);
+                conn.setRequestProperty("User-Agent", WEB_USER_AGENT);
+                conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+
+                try (InputStream in = conn.getInputStream()) {
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    byte[] chunk = new byte[16384];
+                    int read;
+                    while ((read = in.read(chunk)) != -1) {
+                        buffer.write(chunk, 0, read);
+                    }
+                    String html = buffer.toString(StandardCharsets.UTF_8.name());
+                    Matcher m = JSON_VIDEO_ID.matcher(html);
+                    while (m.find()) {
+                        ids.add(m.group(1));
+                    }
+                } finally {
+                    conn.disconnect();
+                }
+            } catch (Exception ex) {
+                Logger.printException(() -> "Could not fetch remote playlist page", ex);
+            }
+        }
+
+        // 2. Also support direct video URLs or space/comma/newline-separated 11-char video IDs
+        Matcher directMatcher = DIRECT_VIDEO_ID.matcher(trimmed);
+        while (directMatcher.find()) {
+            ids.add(directMatcher.group(1));
+        }
+
+        if (ids.isEmpty()) {
+            String[] tokens = trimmed.split("[\\s,;]+");
+            for (String token : tokens) {
+                if (token.matches("[A-Za-z0-9_-]{11}")) {
+                    ids.add(token);
+                }
+            }
+        }
+
+        return new ArrayList<>(ids);
+    }
+
+    private static void downloadBlocking(String videoId, @Nullable String title, @Nullable String artist,
+                                         @Nullable String album, int duration, @Nullable Bitmap artwork,
+                                         @Nullable String targetPlaylistName, boolean showToasts) {
+        Context context = Utils.getContext();
+        File directory = new File(
+                context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
+
+        if (targetPlaylistName != null && !targetPlaylistName.isBlank()) {
+            OfflineStorage.addTrackToPlaylist(directory, targetPlaylistName, videoId);
+        }
+
+        if (OfflineStorage.isTrackDownloaded(directory, videoId)) {
+            Logger.printDebug(() -> "Already downloaded: " + videoId);
+            if (showToasts) Utils.showToastShort(str("morphe_music_downloads_already_saved"));
+            notifyListeners(videoId, true);
             return;
         }
 
+        if (!ACTIVE_DOWNLOADS.add(videoId)) {
+            if (showToasts) Utils.showToastShort(str("morphe_music_downloads_already_running"));
+            return;
+        }
+
+        notifyListeners(videoId, false);
+
         try {
-            Context context = Utils.getContext();
-            File directory = new File(
-                    context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
-
-            if (new File(directory, videoId + ".webm").isFile()
-                    || new File(directory, videoId + ".m4a").isFile()) {
-                Logger.printDebug(() -> "Already downloaded: " + videoId);
-                Utils.showToastShort(str("morphe_music_downloads_already_saved"));
-                return;
-            }
-
             ResolvedStream resolved = resolveStream(videoId);
             if (resolved == null || resolved.format().getUrl().isBlank()) {
                 throw new IllegalStateException("Audio stream unavailable");
             }
 
             Format format = resolved.format();
-            Logger.printDebug(() -> "Downloading " + videoId + " as itag " + format.getItag()
-                    + " (" + format.getMimeType() + ")");
-
             VideoDetails details = resolved.details();
 
-            // Anything the caller already knows wins, the player response only fills the blanks.
             title = firstNotBlank(title, details.getTitle(), videoId);
             artist = firstNotBlank(artist, stripTopic(details.getOwnerChannelName()), "");
             if (duration <= 0) duration = details.getLengthSeconds();
@@ -158,7 +330,7 @@ public final class LocalDownloadManager {
             }
 
             downloadWithResume(videoId, title, format.getUrl(), temporary,
-                    format.getContentLength());
+                    format.getContentLength(), showToasts);
 
             if (destination.exists() && !destination.delete()) {
                 throw new IllegalStateException("Could not replace audio file");
@@ -166,17 +338,17 @@ public final class LocalDownloadManager {
             if (!temporary.renameTo(destination)) {
                 throw new IllegalStateException("Could not finish audio file");
             }
-            Logger.printDebug(() -> "Saved " + destination + " (" + destination.length() + " bytes)");
 
             OfflineTrack.save(directory, videoId, title, artist, album, duration, artwork);
-            Utils.showToastShort(str("morphe_music_downloads_complete"));
+            if (showToasts) Utils.showToastShort(str("morphe_music_downloads_complete"));
         } catch (Exception ex) {
             Logger.printException(() -> "Local audio download failed: " + videoId, ex);
             awaitNotificationSlot();
             showDownloadNotification(videoId, title, 0, false, str("morphe_music_downloads_failed"));
-            Utils.showToastShort(str("morphe_music_downloads_failed"));
+            if (showToasts) Utils.showToastShort(str("morphe_music_downloads_failed"));
         } finally {
             ACTIVE_DOWNLOADS.remove(videoId);
+            notifyListeners(videoId, true);
         }
     }
 
@@ -185,18 +357,17 @@ public final class LocalDownloadManager {
 
     private static String firstNotBlank(@Nullable String value, String fallback, String lastResort) {
         if (value != null && !value.isBlank()) return value;
-        if (!fallback.isBlank()) return fallback;
+        if (fallback != null && !fallback.isBlank()) return fallback;
         return lastResort;
     }
 
-    /** Music uploads are owned by an "Artist - Topic" channel, which is not the artist name. */
     private static String stripTopic(String channelName) {
+        if (channelName == null) return "";
         return channelName.endsWith(" - Topic")
                 ? channelName.substring(0, channelName.length() - " - Topic".length())
                 : channelName;
     }
 
-    /** @return Whether a progress update may be posted without the system dropping it. */
     private static boolean canPostProgress() {
         long now = System.currentTimeMillis();
         long previous = lastNotificationTime.get();
@@ -204,11 +375,6 @@ public final class LocalDownloadManager {
                 && lastNotificationTime.compareAndSet(previous, now);
     }
 
-    /**
-     * Waits for the next slot, so a notification that matters is never the one being dropped.
-     * The loop sleeps exactly as long as the slot is away, and repeats only if another thread
-     * took the slot first. Must be called off the main thread.
-     */
     private static void awaitNotificationSlot() {
         while (true) {
             long now = System.currentTimeMillis();
@@ -230,10 +396,6 @@ public final class LocalDownloadManager {
         }
     }
 
-    /**
-     * Some videos come back without any video details, so the thumbnail of the id is used as a
-     * fallback. It exists for every video, while the largest size does not.
-     */
     @Nullable
     private static Bitmap resolveArtwork(String videoId, VideoDetails details) {
         Bitmap artwork = downloadArtwork(largestThumbnail(details));
@@ -268,8 +430,8 @@ public final class LocalDownloadManager {
     }
 
     private static void downloadWithResume(String videoId, String title, String url,
-                                           File temporary, long expectedLength) throws Exception {
-        Utils.showToastShort(str("morphe_music_downloads_started"));
+                                           File temporary, long expectedLength, boolean showToasts) throws Exception {
+        if (showToasts) Utils.showToastShort(str("morphe_music_downloads_started"));
         awaitNotificationSlot();
         showDownloadNotification(videoId, title, 0, true, str("morphe_music_downloads_starting"));
 
@@ -299,7 +461,6 @@ public final class LocalDownloadManager {
         AtomicLong downloaded = new AtomicLong();
         long segmentSize = (totalLength + SEGMENT_COUNT - 1) / SEGMENT_COUNT;
 
-        // Android's ExecutorService is not AutoCloseable, so it is shut down in the finally below.
         //noinspection resource
         ExecutorService executor = Executors.newFixedThreadPool(SEGMENT_COUNT);
         List<Future<?>> futures = new ArrayList<>();
@@ -430,17 +591,12 @@ public final class LocalDownloadManager {
         }
     }
 
-    /**
-     * Segments report progress from their own threads, and {@code notify} is a oneway binder
-     * call whose order only holds per sending thread. Posting every update from the main thread
-     * stops late progress from replacing the completed state on screen.
-     */
     static void showDownloadNotification(String key, String title, int progress,
                                          boolean ongoing, String text) {
         Utils.runOnMainThread(() -> postDownloadNotification(key, title, progress, ongoing, text));
     }
 
-    @SuppressLint("NotificationPermission") // The patch declares POST_NOTIFICATIONS.
+    @SuppressLint("NotificationPermission")
     private static void postDownloadNotification(String key, String title, int progress,
                                                  boolean ongoing, String text) {
         Context context = Utils.getContext();
@@ -470,8 +626,6 @@ public final class LocalDownloadManager {
         StreamingDataRequest request = StreamingDataRequest.getRequestForVideoId(videoId);
         if (request == null) {
             Logger.printDebug(() -> "No cached streaming request for download, resolving: " + videoId);
-            // The clients are named here because the playback order is only set up while spoofing
-            // is on, and a download needs a client that answers with plain urls either way.
             request = StreamingDataRequest.fetchRequestForDownload(videoId,
                     SpoofVideoStreamsPatch.getAvailableClients(),
                     Settings.SPOOF_VIDEO_STREAMS_CLIENT_TYPE.get());

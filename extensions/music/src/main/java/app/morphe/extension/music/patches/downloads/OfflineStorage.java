@@ -22,16 +22,21 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import app.morphe.extension.shared.Logger;
 
 /**
- * File access shared by the offline catalogue and local playlists.
+ * File access shared by the offline catalogue and local auto-downloading playlists.
  */
 final class OfflineStorage {
 
-    record Playlist(String name, List<String> videoIds) {
+    record Playlist(String name, List<String> videoIds, boolean autoDownload, String remoteId) {
+        Playlist(String name, List<String> videoIds) {
+            this(name, videoIds, true, "");
+        }
     }
 
     private static final String PLAYLISTS_FILE = "playlists.json";
@@ -84,6 +89,11 @@ final class OfflineStorage {
         }
     }
 
+    static boolean isTrackDownloaded(File musicRoot, String videoId) {
+        return new File(musicRoot, videoId + ".webm").isFile()
+                || new File(musicRoot, videoId + ".m4a").isFile();
+    }
+
     static List<Playlist> loadPlaylists(File musicRoot) {
         List<Playlist> result = new ArrayList<>();
         File file = new File(musicRoot, PLAYLISTS_FILE);
@@ -97,6 +107,9 @@ final class OfflineStorage {
                 String name = obj.optString("name", "").trim();
                 if (name.isEmpty()) continue;
 
+                boolean autoDownload = obj.optBoolean("autoDownload", true);
+                String remoteId = obj.optString("remoteId", "");
+
                 List<String> ids = new ArrayList<>();
                 JSONArray tracks = obj.optJSONArray("tracks");
                 if (tracks != null) {
@@ -107,7 +120,7 @@ final class OfflineStorage {
                         }
                     }
                 }
-                result.add(new Playlist(name, ids));
+                result.add(new Playlist(name, ids, autoDownload, remoteId));
             }
         } catch (Exception ex) {
             Logger.printException(() -> "Could not read playlists: " + file, ex);
@@ -115,7 +128,7 @@ final class OfflineStorage {
         return result;
     }
 
-    static void savePlaylists(File musicRoot, List<Playlist> playlists) {
+    static synchronized void savePlaylists(File musicRoot, List<Playlist> playlists) {
         try {
             if (!musicRoot.isDirectory() && !musicRoot.mkdirs()) {
                 return;
@@ -128,6 +141,8 @@ final class OfflineStorage {
                 }
                 JSONObject obj = new JSONObject()
                         .put("name", playlist.name())
+                        .put("autoDownload", playlist.autoDownload())
+                        .put("remoteId", playlist.remoteId() == null ? "" : playlist.remoteId())
                         .put("tracks", tracks);
                 array.put(obj);
             }
@@ -137,7 +152,11 @@ final class OfflineStorage {
         }
     }
 
-    static boolean createPlaylist(File musicRoot, String rawName) {
+    static synchronized boolean createPlaylist(File musicRoot, String rawName) {
+        return createPlaylist(musicRoot, rawName, "");
+    }
+
+    static synchronized boolean createPlaylist(File musicRoot, String rawName, String remoteId) {
         String name = rawName == null ? "" : rawName.trim();
         if (name.isEmpty()) return false;
 
@@ -145,18 +164,18 @@ final class OfflineStorage {
         for (Playlist p : playlists) {
             if (p.name().equalsIgnoreCase(name)) return false;
         }
-        playlists.add(new Playlist(name, new ArrayList<>()));
+        playlists.add(new Playlist(name, new ArrayList<>(), true, remoteId == null ? "" : remoteId.trim()));
         savePlaylists(musicRoot, playlists);
         return true;
     }
 
-    static void deletePlaylist(File musicRoot, String name) {
+    static synchronized void deletePlaylist(File musicRoot, String name) {
         List<Playlist> playlists = loadPlaylists(musicRoot);
         playlists.removeIf(p -> p.name().equalsIgnoreCase(name));
         savePlaylists(musicRoot, playlists);
     }
 
-    static boolean addTrackToPlaylist(File musicRoot, String playlistName, String videoId) {
+    static synchronized boolean addTrackToPlaylist(File musicRoot, String playlistName, String videoId) {
         List<Playlist> playlists = loadPlaylists(musicRoot);
         for (Playlist p : playlists) {
             if (p.name().equalsIgnoreCase(playlistName)) {
@@ -169,7 +188,40 @@ final class OfflineStorage {
         return false;
     }
 
-    static void removeTrackFromPlaylist(File musicRoot, String playlistName, String videoId) {
+    static synchronized int addTracksToPlaylist(File musicRoot, String playlistName, List<String> videoIds) {
+        List<Playlist> playlists = loadPlaylists(musicRoot);
+        int added = 0;
+        for (Playlist p : playlists) {
+            if (p.name().equalsIgnoreCase(playlistName)) {
+                for (String id : videoIds) {
+                    if (id != null && !id.isBlank() && !p.videoIds().contains(id)) {
+                        p.videoIds().add(id);
+                        added++;
+                    }
+                }
+                if (added > 0) savePlaylists(musicRoot, playlists);
+                return added;
+            }
+        }
+        return 0;
+    }
+
+    static synchronized List<String> getMissingVideoIds(File musicRoot, @Nullable String playlistName) {
+        Set<String> missing = new LinkedHashSet<>();
+        List<Playlist> playlists = loadPlaylists(musicRoot);
+        for (Playlist p : playlists) {
+            if (playlistName != null && !p.name().equalsIgnoreCase(playlistName)) continue;
+            if (playlistName == null && !p.autoDownload()) continue;
+            for (String videoId : p.videoIds()) {
+                if (!isTrackDownloaded(musicRoot, videoId)) {
+                    missing.add(videoId);
+                }
+            }
+        }
+        return new ArrayList<>(missing);
+    }
+
+    static synchronized void removeTrackFromPlaylist(File musicRoot, String playlistName, String videoId) {
         List<Playlist> playlists = loadPlaylists(musicRoot);
         for (Playlist p : playlists) {
             if (p.name().equalsIgnoreCase(playlistName)) {
@@ -180,7 +232,7 @@ final class OfflineStorage {
         }
     }
 
-    static void removeTrackFromAllPlaylists(File musicRoot, String videoId) {
+    static synchronized void removeTrackFromAllPlaylists(File musicRoot, String videoId) {
         List<Playlist> playlists = loadPlaylists(musicRoot);
         boolean modified = false;
         for (Playlist p : playlists) {

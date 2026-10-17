@@ -8,6 +8,7 @@
 package app.morphe.extension.music.patches.downloads;
 
 import android.graphics.Bitmap;
+import android.graphics.Color;
 
 import androidx.annotation.Nullable;
 
@@ -73,6 +74,45 @@ public record OfflineTrack(String videoId, String title, String artist, String a
 
     public String displayArtist() {
         return artist.isBlank() ? "YouTube Music" : artist;
+    }
+
+    public String displayAlbum() {
+        return album == null || album.isBlank() ? displayArtist() : album;
+    }
+
+    /**
+     * Extracts a darkened ambient color from the track artwork for the full-screen YT Music player.
+     */
+    public int extractDominantColor(int fallbackColor) {
+        Bitmap bmp = artwork(64);
+        if (bmp == null) return fallbackColor;
+
+        long r = 0, g = 0, b = 0, count = 0;
+        int width = bmp.getWidth();
+        int height = bmp.getHeight();
+
+        for (int x = 0; x < width; x += 2) {
+            for (int y = 0; y < height; y += 2) {
+                int pixel = bmp.getPixel(x, y);
+                int pr = Color.red(pixel);
+                int pg = Color.green(pixel);
+                int pb = Color.blue(pixel);
+                // Ignore near-black and near-white pixels for richer ambient tint
+                int brightness = (pr + pg + pb) / 3;
+                if (brightness > 20 && brightness < 235) {
+                    r += pr;
+                    g += pg;
+                    b += pb;
+                    count++;
+                }
+            }
+        }
+
+        if (count == 0) return fallbackColor;
+        int avgR = (int) ((r / count) * 0.45f);
+        int avgG = (int) ((g / count) * 0.45f);
+        int avgB = (int) ((b / count) * 0.45f);
+        return Color.rgb(Math.max(18, avgR), Math.max(18, avgG), Math.max(18, avgB));
     }
 
     private static String stripExtension(String name) {

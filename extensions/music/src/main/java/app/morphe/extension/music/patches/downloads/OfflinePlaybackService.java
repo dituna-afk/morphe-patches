@@ -38,12 +38,14 @@ import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 import app.morphe.extension.shared.Logger;
 
-/** Foreground offline player with audio focus, MediaSession, repeat modes and seek controls. */
+/** Foreground offline player with audio focus, MediaSession, shuffle, repeat modes and seek controls. */
 public final class OfflinePlaybackService extends Service {
     public interface PlaybackListener {
         void onPlaybackChanged(String path, String title, boolean playing, int position, int duration);
@@ -60,6 +62,7 @@ public final class OfflinePlaybackService extends Service {
     private static volatile int currentPosition;
     private static volatile int currentDuration;
     private static volatile int currentRepeatMode = REPEAT_OFF;
+    private static volatile boolean shuffleEnabled = false;
     private static volatile OfflinePlaybackService instance;
 
     public static void addListener(PlaybackListener listener) {
@@ -112,6 +115,40 @@ public final class OfflinePlaybackService extends Service {
         return currentRepeatMode;
     }
 
+    public static boolean isShuffleEnabled() {
+        return shuffleEnabled;
+    }
+
+    public static boolean toggleShuffle() {
+        shuffleEnabled = !shuffleEnabled;
+        OfflinePlaybackService service = instance;
+        if (service != null) {
+            service.applyShuffleState();
+            service.publishState();
+        }
+        return shuffleEnabled;
+    }
+
+    public static List<String> getCurrentQueue() {
+        OfflinePlaybackService service = instance;
+        return service == null ? Collections.emptyList() : new ArrayList<>(service.queue);
+    }
+
+    public static int getCurrentQueueIndex() {
+        OfflinePlaybackService service = instance;
+        return service == null ? -1 : service.queueIndex;
+    }
+
+    public static void playAtQueueIndex(int index) {
+        OfflinePlaybackService service = instance;
+        if (service != null && index >= 0 && index < service.queue.size()) {
+            service.queueIndex = index;
+            OfflineTrack track = OfflineTrack.load(new File(service.queue.get(index)));
+            service.playFile(track.audioFile().getAbsolutePath(), track.displayTitle(),
+                    track.displayArtist(), track.artworkFile().getAbsolutePath());
+        }
+    }
+
     public static final String ACTION_PLAY_FILE = "app.morphe.action.PLAY_OFFLINE_FILE";
     public static final String ACTION_TOGGLE = "app.morphe.action.TOGGLE_OFFLINE_PLAYBACK";
     public static final String ACTION_STOP = "app.morphe.action.STOP_OFFLINE_PLAYBACK";
@@ -138,6 +175,7 @@ public final class OfflinePlaybackService extends Service {
     private String title = "YouTube Music";
     private String artist = "YouTube Music";
     private Bitmap artwork;
+    private ArrayList<String> originalQueue = new ArrayList<>();
     private ArrayList<String> queue = new ArrayList<>();
     private int queueIndex = -1;
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
@@ -202,8 +240,12 @@ public final class OfflinePlaybackService extends Service {
         if (ACTION_PLAY_FILE.equals(action)) {
             ArrayList<String> suppliedQueue = intent.getStringArrayListExtra(EXTRA_QUEUE);
             if (suppliedQueue != null) {
-                queue = suppliedQueue;
+                originalQueue = new ArrayList<>(suppliedQueue);
+                queue = new ArrayList<>(suppliedQueue);
                 queueIndex = intent.getIntExtra(EXTRA_QUEUE_INDEX, -1);
+                if (shuffleEnabled) {
+                    applyShuffleState();
+                }
             }
             playFile(intent.getStringExtra(EXTRA_PATH), intent.getStringExtra(EXTRA_TITLE),
                     intent.getStringExtra(EXTRA_ARTIST), intent.getStringExtra(EXTRA_ARTWORK_PATH));
@@ -218,6 +260,24 @@ public final class OfflinePlaybackService extends Service {
             playQueueOffset(-1);
         }
         return START_NOT_STICKY;
+    }
+
+    private void applyShuffleState() {
+        if (originalQueue.isEmpty()) return;
+        String activeTrack = (queueIndex >= 0 && queueIndex < queue.size()) ? queue.get(queueIndex) : path;
+        if (shuffleEnabled) {
+            ArrayList<String> shuffled = new ArrayList<>(originalQueue);
+            shuffled.remove(activeTrack);
+            Collections.shuffle(shuffled);
+            if (activeTrack != null && !activeTrack.isEmpty() && originalQueue.contains(activeTrack)) {
+                shuffled.add(0, activeTrack);
+                queueIndex = 0;
+            }
+            queue = shuffled;
+        } else {
+            queue = new ArrayList<>(originalQueue);
+            queueIndex = Math.max(0, queue.indexOf(activeTrack));
+        }
     }
 
     private void playFile(@Nullable String path, @Nullable String requestedTitle,
@@ -283,7 +343,6 @@ public final class OfflinePlaybackService extends Service {
     private void playQueueOffset(int offset) {
         if (queue.isEmpty()) return;
 
-        // 3 saniyeden fazla çaldıysa Önceki tuşu şarkıyı en başa sarar.
         if (offset < 0 && playerReady() && player.getCurrentPosition() > 3000) {
             player.seekTo(0);
             publishState();
