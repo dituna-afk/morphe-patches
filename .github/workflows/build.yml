@@ -5,7 +5,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -13,14 +14,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Build with Gradle
         run: |
           chmod +x gradlew
           ./gradlew build --no-daemon
         env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
           GPR_USER: ${{ github.actor }}
           GPR_KEY: ${{ secrets.GITHUB_TOKEN }}
 
