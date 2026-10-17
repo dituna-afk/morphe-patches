@@ -20,8 +20,8 @@ jobs:
           ./gradlew build --no-daemon
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
-          GPR_USER: ${{ github.actor }}
-          GPR_KEY: ${{ secrets.GITHUB_TOKEN }}
+          GPR_USER: dituna-afk
+          GPR_KEY: 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
 
       - name: Upload Patch Artifact
         uses: actions/upload-artifact@v4
