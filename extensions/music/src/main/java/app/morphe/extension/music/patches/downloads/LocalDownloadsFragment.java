@@ -2,29 +2,31 @@ package app.morphe.extension.music.patches.downloads;
 
 import static app.morphe.extension.shared.StringRef.str;
 
+import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
+import android.graphics.LinearGradient;
 import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.Typeface;
-import android.graphics.drawable.AnimatedVectorDrawable;
-import android.graphics.drawable.ClipDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.graphics.drawable.ShapeDrawable;
 import android.graphics.drawable.shapes.OvalShape;
@@ -32,12 +34,12 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.preference.PreferenceFragment;
 import android.text.TextUtils;
+import android.util.LruCache;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
-import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
@@ -77,37 +79,107 @@ import app.morphe.extension.shared.ui.CustomDialog;
 public final class LocalDownloadsFragment extends PreferenceFragment
         implements OfflinePlaybackService.PlaybackListener, LocalDownloadManager.DownloadListener {
 
-    private static final int SEEK_BAR_HEIGHT_DP = 3;
-    private static final int SEEK_BAR_TOUCH_DP = 28;
+    private static final int SEEK_BAR_HEIGHT_DP = 4;
+    private static final int SEEK_BAR_TOUCH_DP = 32;
     private static final int SEEK_THUMB_DP = 14;
     private static final int SEARCH_BAR_HEIGHT_DP = 46;
     private static final long SEARCH_ANIMATION_MILLISECONDS = 180;
-    private static final float SECONDARY_DIM = 0.70f;
-    private static final float PLAYING_ROW_BRIGHTNESS = 1.35f;
-    private static final int ROW_CORNER_DP = 8;
-    private static final int ROW_ARTWORK_PIXELS = 256;
+    private static final int ROW_CORNER_DP = 10;
+    private static final int ROW_ARTWORK_PIXELS = 192;
     private static final int FULL_ARTWORK_PIXELS = 720;
-    private static final int ARTWORK_CORNER_DP = 6;
-    private static final int FULL_ARTWORK_CORNER_DP = 12;
-    private static final int MENU_WIDTH_DP = 230;
-    private static final int MENU_CORNER_DP = 12;
+    private static final int ARTWORK_CORNER_DP = 8;
+    private static final int FULL_ARTWORK_CORNER_DP = 14;
+    private static final int MENU_WIDTH_DP = 240;
+    private static final int MENU_CORNER_DP = 14;
     private static final int ICON_BUTTON_DP = 44;
 
     private static final int ICON_CHEVRON_DOWN = 1;
     private static final int ICON_SHUFFLE = 2;
     private static final int ICON_REPEAT = 3;
+    private static final int ICON_PLAY = 4;
+    private static final int ICON_PAUSE = 5;
+    private static final int ICON_SKIP_PREV = 6;
+    private static final int ICON_SKIP_NEXT = 7;
+    private static final int ICON_PALETTE = 8;
+
+    private static final String PREF_NAME = "morphe_anime_theme_prefs";
+    private static final String PREF_THEME_KEY = "selected_anime_theme";
+
+    // Bellek içi yüksek hızlı Bitmap önbelleği (UI takılmalarını önler)
+    private static final LruCache<String, Bitmap> ARTWORK_CACHE = new LruCache<>(80);
+
+    public enum AnimeTheme {
+        EVANGELION(
+                "Evangelion (EVA-01)",
+                Color.parseColor("#3D165B"), // EVA-01 Zırh Moru
+                Color.parseColor("#160A24"), // Tokyo-3 Gece Moru
+                Color.parseColor("#09040E"), // NERV Derin Siyah
+                Color.parseColor("#39FF14"), // EVA-01 Siber Neon Yeşil (İlerleme çubuğu & vurgu)
+                Color.parseColor("#FF6D00"), // NERV / AT-Field Turuncu (İkincil geçiş)
+                Color.parseColor("#0D0814")  // Oynatma Butonu İkon Rengi
+        ),
+        COWBOY_BEBOP(
+                "Cowboy Bebop",
+                Color.parseColor("#8E1616"), // Swordfish II Kızılı
+                Color.parseColor("#131D36"), // Spike Spiegel Uzay Laciverti
+                Color.parseColor("#080C17"), // Bebop Gece Siyahı
+                Color.parseColor("#FFB300"), // Caz Kehribar / Altın Sarısı
+                Color.parseColor("#EF5350"), // Neon Kızıl Geçiş
+                Color.parseColor("#0B0F19")
+        ),
+        BERSERK(
+                "Berserk (Eclipse)",
+                Color.parseColor("#6E0711"), // Kurban Damgası Kan Kırmızısı
+                Color.parseColor("#1C0608"), // Tutulma Koyu Bordo
+                Color.parseColor("#060606"), // Berserker Zırhı Obsidyen Siyahı
+                Color.parseColor("#FF1744"), // Kor Kan Kızılı
+                Color.parseColor("#B71C1C"), // Derin Kızıl
+                Color.parseColor("#080808")
+        ),
+        ANIME_FUSION(
+                "Eva × Bebop × Berserk Geçiş",
+                Color.parseColor("#4A154B"), // Evangelion Moru
+                Color.parseColor("#7F1D1D"), // Berserk Kan Kırmızısı
+                Color.parseColor("#0F172A"), // Cowboy Bebop Gece Mavisi
+                Color.parseColor("#39FF14"), // Eva Yeşil -> Bebop Altın -> Berserk Kızıl
+                Color.parseColor("#FFB300"),
+                Color.parseColor("#09090B")
+        );
+
+        final String label;
+        final int gradTop;
+        final int gradMid;
+        final int gradBottom;
+        final int accentPrimary;
+        final int accentSecondary;
+        final int playIconDark;
+
+        AnimeTheme(String label, int gradTop, int gradMid, int gradBottom,
+                   int accentPrimary, int accentSecondary, int playIconDark) {
+            this.label = label;
+            this.gradTop = gradTop;
+            this.gradMid = gradMid;
+            this.gradBottom = gradBottom;
+            this.accentPrimary = accentPrimary;
+            this.accentSecondary = accentSecondary;
+            this.playIconDark = playIconDark;
+        }
+    }
 
     private File musicRoot;
-    private LinearLayout miniPlayer, songsList, playlistChipsContainer, fullPlayerRoot;
+    private LinearLayout rootLayout, miniPlayer, songsList, playlistChipsContainer, fullPlayerRoot;
     private ProgressBar miniProgressBar;
     private ImageView miniArtwork, fullArtwork;
-    private TextView miniTitle, miniArtist, fullTitle, fullArtist, fullCurrentTime, fullTotalTime, summary;
+    private TextView miniTitle, miniArtist, fullTitle, fullArtist, fullCurrentTime, fullTotalTime, summary, themePillText;
     private ImageButton miniPlay, miniNext, fullPlayBtn, fullPrevBtn, fullNextBtn, fullShuffleBtn, fullRepeatBtn;
     private SeekBar fullSeek;
     private EditText searchBar;
     @Nullable private Dialog fullPlayerDialog;
+    @Nullable private ValueAnimator fusionAnimator;
+    private float fusionPhase = 0f;
 
-    private boolean showingPause, userSeeking;
+    private AnimeTheme currentTheme = AnimeTheme.EVANGELION;
+    private boolean showingPause, userSeeking, likedCurrentTrack;
     private List<OfflineTrack> tracks = new ArrayList<>();
     private List<OfflineStorage.Playlist> playlists = new ArrayList<>();
     @Nullable private String selectedPlaylist = null;
@@ -125,26 +197,29 @@ public final class LocalDownloadsFragment extends PreferenceFragment
 
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle state) {
+        loadSavedTheme();
         musicRoot = new File(getActivity().getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
-        LinearLayout root = new LinearLayout(getActivity());
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(background());
-        root.addView(createHeader(), new LinearLayout.LayoutParams(-1, -2));
+
+        rootLayout = new LinearLayout(getActivity());
+        rootLayout.setOrientation(LinearLayout.VERTICAL);
+        applyListBackground();
+        rootLayout.addView(createHeader(), new LinearLayout.LayoutParams(-1, -2));
 
         ScrollView scroll = new ScrollView(getActivity());
         songsList = new LinearLayout(getActivity());
         songsList.setOrientation(LinearLayout.VERTICAL);
         songsList.setPadding(dp(8), 0, dp(8), dp(12));
         scroll.addView(songsList);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        rootLayout.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
         miniPlayer = createOriginalYtMusicMiniPlayer();
         miniPlayer.setVisibility(View.GONE);
-        root.addView(miniPlayer, new LinearLayout.LayoutParams(-1, -2));
+        rootLayout.addView(miniPlayer, new LinearLayout.LayoutParams(-1, -2));
 
         showTracks();
         LocalDownloadManager.syncPlaylists(musicRoot, null, false);
-        return root;
+        startOrStopFusionAnimator();
+        return rootLayout;
     }
 
     @Override
@@ -152,13 +227,157 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         super.onStart();
         OfflinePlaybackService.addListener(this);
         LocalDownloadManager.addListener(this);
+        startOrStopFusionAnimator();
     }
 
     @Override
     public void onStop() {
         OfflinePlaybackService.removeListener(this);
         LocalDownloadManager.removeListener(this);
+        stopFusionAnimator();
         super.onStop();
+    }
+
+    private void loadSavedTheme() {
+        try {
+            SharedPreferences prefs = getActivity().getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+            String saved = prefs.getString(PREF_THEME_KEY, AnimeTheme.EVANGELION.name());
+            currentTheme = AnimeTheme.valueOf(saved);
+        } catch (Exception ignored) {
+            currentTheme = AnimeTheme.EVANGELION;
+        }
+    }
+
+    private void cycleAnimeTheme() {
+        AnimeTheme[] values = AnimeTheme.values();
+        currentTheme = values[(currentTheme.ordinal() + 1) % values.length];
+        try {
+            getActivity().getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                    .edit().putString(PREF_THEME_KEY, currentTheme.name()).apply();
+        } catch (Exception ignored) {
+        }
+        Utils.showToastShort("Tema: " + currentTheme.label);
+        startOrStopFusionAnimator();
+        refreshAllThemeVisuals();
+    }
+
+    private void startOrStopFusionAnimator() {
+        stopFusionAnimator();
+        if (currentTheme != AnimeTheme.ANIME_FUSION) return;
+
+        fusionAnimator = ValueAnimator.ofFloat(0f, 1f);
+        fusionAnimator.setDuration(7500);
+        fusionAnimator.setRepeatCount(ValueAnimator.INFINITE);
+        fusionAnimator.setRepeatMode(ValueAnimator.REVERSE);
+        fusionAnimator.addUpdateListener(anim -> {
+            fusionPhase = (float) anim.getAnimatedValue();
+            updateDynamicPlayerColors();
+        });
+        fusionAnimator.start();
+    }
+
+    private void stopFusionAnimator() {
+        if (fusionAnimator != null) {
+            fusionAnimator.cancel();
+            fusionAnimator = null;
+        }
+    }
+
+    private int activeAccentColor() {
+        if (currentTheme == AnimeTheme.ANIME_FUSION) {
+            ArgbEvaluator eval = new ArgbEvaluator();
+            if (fusionPhase < 0.5f) {
+                return (int) eval.evaluate(fusionPhase * 2f,
+                        AnimeTheme.EVANGELION.accentPrimary,
+                        AnimeTheme.COWBOY_BEBOP.accentPrimary);
+            } else {
+                return (int) eval.evaluate((fusionPhase - 0.5f) * 2f,
+                        AnimeTheme.COWBOY_BEBOP.accentPrimary,
+                        AnimeTheme.BERSERK.accentPrimary);
+            }
+        }
+        return currentTheme.accentPrimary;
+    }
+
+    private int activeSecondaryAccent() {
+        if (currentTheme == AnimeTheme.ANIME_FUSION) {
+            ArgbEvaluator eval = new ArgbEvaluator();
+            return (int) eval.evaluate(fusionPhase,
+                    AnimeTheme.BERSERK.accentPrimary,
+                    AnimeTheme.COWBOY_BEBOP.accentPrimary);
+        }
+        return currentTheme.accentSecondary;
+    }
+
+    private GradientDrawable buildAnimeBackgroundGradient(@Nullable OfflineTrack track) {
+        if (currentTheme == AnimeTheme.ANIME_FUSION) {
+            ArgbEvaluator eval = new ArgbEvaluator();
+            int c1 = (int) eval.evaluate(fusionPhase, AnimeTheme.EVANGELION.gradTop, AnimeTheme.COWBOY_BEBOP.gradTop);
+            int c2 = (int) eval.evaluate(fusionPhase, AnimeTheme.COWBOY_BEBOP.gradMid, AnimeTheme.BERSERK.gradTop);
+            int c3 = (int) eval.evaluate(fusionPhase, AnimeTheme.BERSERK.gradBottom, AnimeTheme.EVANGELION.gradBottom);
+            return new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{c1, c2, c3});
+        }
+        int top = currentTheme.gradTop;
+        if (track != null) {
+            int dom = track.extractDominantColor(top);
+            top = blendColors(currentTheme.gradTop, dom, 0.35f);
+        }
+        return new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{top, currentTheme.gradMid, currentTheme.gradBottom});
+    }
+
+    private static int blendColors(int c1, int c2, float ratio) {
+        float inv = 1f - ratio;
+        int r = (int) (Color.red(c1) * inv + Color.red(c2) * ratio);
+        int g = (int) (Color.green(c1) * inv + Color.green(c2) * ratio);
+        int b = (int) (Color.blue(c1) * inv + Color.blue(c2) * ratio);
+        return Color.rgb(r, g, b);
+    }
+
+    private void applyListBackground() {
+        if (rootLayout == null) return;
+        rootLayout.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{
+                        blendColors(currentTheme.gradMid, Color.BLACK, 0.35f),
+                        currentTheme.gradBottom
+                }));
+    }
+
+    private void refreshAllThemeVisuals() {
+        applyListBackground();
+        rebuildPlaylistChips();
+        markPlayingRow();
+        updateDynamicPlayerColors();
+    }
+
+    private void updateDynamicPlayerColors() {
+        OfflineTrack cur = findByPath(playingPath);
+        if (fullPlayerRoot != null) {
+            fullPlayerRoot.setBackground(buildAnimeBackgroundGradient(cur));
+        }
+        if (themePillText != null) {
+            themePillText.setText("🎨 " + currentTheme.label);
+        }
+        if (fullSeek != null) {
+            fullSeek.invalidate();
+        }
+        if (miniProgressBar != null) {
+            miniProgressBar.invalidate();
+        }
+        if (fullPlayBtn != null) {
+            GradientDrawable playCircle = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    new int[]{activeAccentColor(), activeSecondaryAccent()});
+            playCircle.setShape(GradientDrawable.OVAL);
+            fullPlayBtn.setBackground(new RippleDrawable(
+                    ColorStateList.valueOf(Color.argb(90, 255, 255, 255)), playCircle, playCircle));
+            fullPlayBtn.setImageDrawable(createVectorIconDrawable(
+                    showingPause ? ICON_PAUSE : ICON_PLAY, currentTheme.playIconDark, 0));
+        }
+        if (miniPlay != null) {
+            miniPlay.setImageDrawable(createVectorIconDrawable(
+                    showingPause ? ICON_PAUSE : ICON_PLAY, activeAccentColor(), 0));
+        }
+        updateFullShuffleRepeatVisuals();
     }
 
     @Override
@@ -221,6 +440,13 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         summary = text("", 13, secondary());
         line.addView(summary, new LinearLayout.LayoutParams(0, -2, 1));
 
+        ImageButton themeBtn = icon(createVectorIconDrawable(ICON_PALETTE, activeAccentColor(), 0), "Anime Teması Değiştir");
+        themeBtn.setOnClickListener(v -> {
+            cycleAnimeTheme();
+            themeBtn.setImageDrawable(createVectorIconDrawable(ICON_PALETTE, activeAccentColor(), 0));
+        });
+        line.addView(themeBtn, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
         ImageButton search = icon(BaseSearchViewController.getSearchIconDrawable(), str("morphe_music_downloads_search_hint"));
         search.setOnClickListener(v -> toggleSearch());
         line.addView(search, new LinearLayout.LayoutParams(dp(40), dp(40)));
@@ -252,8 +478,10 @@ public final class LocalDownloadsFragment extends PreferenceFragment
             selectedPlaylist = null;
             showTracks();
         }));
-        playlistChipsContainer.addView(createChip("+ Playlist Oluştur / Otomatik İndir", false,
+        playlistChipsContainer.addView(createChip("+ Playlist / Beğenilenler (LM)", false,
                 v -> showCreateOrAutoDownloadPlaylistDialog(null)));
+        playlistChipsContainer.addView(createChip("🎨 " + currentTheme.label, false,
+                v -> cycleAnimeTheme()));
 
         for (OfflineStorage.Playlist playlist : playlists) {
             boolean active = playlist.name().equalsIgnoreCase(selectedPlaylist);
@@ -274,15 +502,18 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     private View createChip(String label, boolean selected, View.OnClickListener onClick) {
-        TextView chip = text(label, 13, selected ? background() : foreground());
+        int accent = activeAccentColor();
+        TextView chip = text(label, 13, selected ? currentTheme.playIconDark : Color.WHITE);
         chip.setTypeface(selected ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
         chip.setPadding(dp(14), dp(7), dp(14), dp(7));
         GradientDrawable shape = new GradientDrawable();
-        shape.setCornerRadius(dp(8));
-        if (selected) shape.setColor(foreground());
-        else {
-            shape.setColor(Utils.adjustColorBrightness(background(), 1.22f));
-            shape.setStroke(dp(1), rippleColor());
+        shape.setCornerRadius(dp(18));
+        if (selected) {
+            shape.setColors(new int[]{accent, activeSecondaryAccent()});
+            shape.setOrientation(GradientDrawable.Orientation.LEFT_RIGHT);
+        } else {
+            shape.setColor(Color.argb(45, 255, 255, 255));
+            shape.setStroke(dp(1), Color.argb(110, Color.red(accent), Color.green(accent), Color.blue(accent)));
         }
         chip.setBackground(new RippleDrawable(ColorStateList.valueOf(rippleColor()), shape, shape));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
@@ -298,13 +529,13 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         container.setPadding(dp(22), dp(18), dp(22), dp(14));
         container.setBackground(menuBackground());
 
-        TextView titleView = text("Oynatma Listesi & Otomatik İndirme", 17, foreground());
+        TextView titleView = text("Oynatma Listesi & Otomatik İndirme", 17, Color.WHITE);
         titleView.setTypeface(Typeface.DEFAULT_BOLD);
         container.addView(titleView, new LinearLayout.LayoutParams(-1, -2));
 
         EditText nameInput = new EditText(getActivity());
-        nameInput.setHint("Liste adı girin (Örn: Favorilerim)");
-        nameInput.setTextColor(foreground());
+        nameInput.setHint("Liste adı girin (Örn: Beğendiklerim)");
+        nameInput.setTextColor(Color.WHITE);
         nameInput.setHintTextColor(secondary());
         nameInput.setSingleLine(true);
         LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
@@ -312,13 +543,24 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         container.addView(nameInput, nameParams);
 
         EditText urlInput = new EditText(getActivity());
-        urlInput.setHint("İsteğe bağlı: YT Music Playlist Linki / ID (Tümünü indirir)");
-        urlInput.setTextColor(foreground());
+        urlInput.setHint("Playlist Linki, ID veya Beğenilenler için 'LM' / 'LL' yazın");
+        urlInput.setTextColor(Color.WHITE);
         urlInput.setHintTextColor(secondary());
         urlInput.setTextSize(13);
         LinearLayout.LayoutParams urlParams = new LinearLayout.LayoutParams(-1, -2);
-        urlParams.setMargins(0, 0, 0, dp(16));
+        urlParams.setMargins(0, 0, 0, dp(10));
         container.addView(urlInput, urlParams);
+
+        TextView quickLikedBtn = createPillButton("❤️ Beğendiğim Şarkıları (LM) Otomatik Doldur", false);
+        quickLikedBtn.setOnClickListener(v -> {
+            if (nameInput.getText().toString().trim().isEmpty()) {
+                nameInput.setText("Beğendiğim Şarkılar");
+            }
+            urlInput.setText("LM");
+        });
+        LinearLayout.LayoutParams quickParams = new LinearLayout.LayoutParams(-2, -2);
+        quickParams.setMargins(0, 0, 0, dp(14));
+        container.addView(quickLikedBtn, quickParams);
 
         LinearLayout actions = new LinearLayout(getActivity());
         actions.setGravity(Gravity.END);
@@ -459,13 +701,16 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(8), dp(7), dp(8), dp(7));
         rowViews.add(row);
-        row.addView(artworkView(track.artwork(ROW_ARTWORK_PIXELS), ARTWORK_CORNER_DP), new LinearLayout.LayoutParams(dp(52), dp(52)));
+
+        ImageView artView = artworkView(null, ARTWORK_CORNER_DP);
+        loadArtworkAsync(track, ROW_ARTWORK_PIXELS, artView);
+        row.addView(artView, new LinearLayout.LayoutParams(dp(52), dp(52)));
 
         LinearLayout labels = new LinearLayout(getActivity());
         labels.setOrientation(LinearLayout.VERTICAL);
         labels.setPadding(dp(14), 0, dp(8), 0);
 
-        TextView name = text(track.displayTitle(), 15, foreground());
+        TextView name = text(track.displayTitle(), 15, Color.WHITE);
         name.setTypeface(Typeface.DEFAULT_BOLD);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
@@ -488,46 +733,79 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         return row;
     }
 
+    private void loadArtworkAsync(OfflineTrack track, int maxSize, ImageView target) {
+        String cacheKey = track.videoId() + "_" + maxSize;
+        target.setTag(cacheKey);
+        Bitmap cached = ARTWORK_CACHE.get(cacheKey);
+        if (cached != null) {
+            target.clearColorFilter();
+            target.setPadding(0, 0, 0, 0);
+            target.setImageBitmap(cached);
+            target.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            return;
+        }
+        Utils.submitOnBackgroundThread(() -> {
+            Bitmap decoded = track.artwork(maxSize);
+            if (decoded != null) {
+                ARTWORK_CACHE.put(cacheKey, decoded);
+                Utils.runOnMainThread(() -> {
+                    if (cacheKey.equals(target.getTag())) {
+                        target.clearColorFilter();
+                        target.setPadding(0, 0, 0, 0);
+                        target.setImageBitmap(decoded);
+                        target.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                    }
+                });
+            }
+            return null;
+        });
+    }
+
     private void markPlayingRow() {
         int idx = queuePaths.indexOf(playingPath);
         for (int i = 0; i < rowViews.size(); i++) rowViews.get(i).setBackground(rowBackground(i == idx));
     }
 
     private Drawable rowBackground(boolean playing) {
-        Drawable card = playing ? CustomDialog.createRoundedBackground(ROW_CORNER_DP,
-                Utils.adjustColorBrightness(ThemeUtils.getAppBackgroundColor(), PLAYING_ROW_BRIGHTNESS)) : null;
+        GradientDrawable card = null;
+        if (playing) {
+            int accent = activeAccentColor();
+            card = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                    new int[]{
+                            Color.argb(65, Color.red(accent), Color.green(accent), Color.blue(accent)),
+                            Color.argb(20, Color.red(accent), Color.green(accent), Color.blue(accent))
+                    });
+            card.setCornerRadius(dp(ROW_CORNER_DP));
+            card.setStroke(dp(1), Color.argb(120, Color.red(accent), Color.green(accent), Color.blue(accent)));
+        }
         return new RippleDrawable(ColorStateList.valueOf(rippleColor()), card,
                 CustomDialog.createRoundedBackground(ROW_CORNER_DP, Color.WHITE));
     }
 
-    private static int rippleColor() {
-        int fg = foreground();
-        return Color.argb(60, Color.red(fg), Color.green(fg), Color.blue(fg));
+    private int rippleColor() {
+        int accent = activeAccentColor();
+        return Color.argb(70, Color.red(accent), Color.green(accent), Color.blue(accent));
     }
 
     private LinearLayout createOriginalYtMusicMiniPlayer() {
         LinearLayout outer = new LinearLayout(getActivity());
         outer.setOrientation(LinearLayout.VERTICAL);
-        outer.setBackgroundColor(Color.parseColor("#212121"));
+        outer.setBackgroundColor(Color.parseColor("#18121E"));
         outer.setClickable(true);
         outer.setFocusable(true);
         outer.setOnClickListener(v -> showFullScreenPlayer());
 
         miniProgressBar = new ProgressBar(getActivity(), null, android.R.attr.progressBarStyleHorizontal);
         miniProgressBar.setMax(1000);
-        ClipDrawable clip = new ClipDrawable(new ColorDrawable(Color.WHITE), Gravity.START, ClipDrawable.HORIZONTAL);
-        LayerDrawable layer = new LayerDrawable(new Drawable[]{new ColorDrawable(Color.argb(55, 255, 255, 255)), clip});
-        layer.setId(0, android.R.id.background);
-        layer.setId(1, android.R.id.progress);
-        miniProgressBar.setProgressDrawable(layer);
-        outer.addView(miniProgressBar, new LinearLayout.LayoutParams(-1, dp(2)));
+        miniProgressBar.setProgressDrawable(createAnimeProgressDrawable(dp(3), false));
+        outer.addView(miniProgressBar, new LinearLayout.LayoutParams(-1, dp(3)));
 
         LinearLayout bar = new LinearLayout(getActivity());
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(dp(12), dp(8), dp(8), dp(8));
 
-        miniArtwork = artworkView(null, 4);
+        miniArtwork = artworkView(null, 6);
         bar.addView(miniArtwork, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         LinearLayout labels = new LinearLayout(getActivity());
@@ -540,7 +818,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         miniTitle.setEllipsize(TextUtils.TruncateAt.END);
         miniTitle.setTypeface(Typeface.DEFAULT_BOLD);
 
-        miniArtist = text("", 12, Color.argb(180, 255, 255, 255));
+        miniArtist = text("", 12, Color.argb(185, 255, 255, 255));
         miniArtist.setSingleLine(true);
         miniArtist.setEllipsize(TextUtils.TruncateAt.END);
 
@@ -548,13 +826,15 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         labels.addView(miniArtist);
         bar.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
 
-        miniPlay = icon("yt_fill_experimental_play_vd_theme_24", str("morphe_music_downloads_play_pause"));
-        miniPlay.setColorFilter(Color.WHITE);
+        miniPlay = new ImageButton(getActivity());
+        miniPlay.setBackground(createCircleRipple());
+        miniPlay.setImageDrawable(createVectorIconDrawable(ICON_PLAY, activeAccentColor(), 0));
         miniPlay.setOnClickListener(v -> OfflinePlaybackService.toggle(getActivity()));
         bar.addView(miniPlay, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
-        miniNext = icon("yt_fill_experimental_skip_next_vd_theme_24", str("morphe_music_downloads_next"));
-        miniNext.setColorFilter(Color.WHITE);
+        miniNext = new ImageButton(getActivity());
+        miniNext.setBackground(createCircleRipple());
+        miniNext.setImageDrawable(createVectorIconDrawable(ICON_SKIP_NEXT, Color.WHITE, 0));
         miniNext.setOnClickListener(v -> OfflinePlaybackService.skipNext(getActivity()));
         bar.addView(miniNext, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
@@ -570,12 +850,13 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         fullPlayerRoot = new LinearLayout(activity);
         fullPlayerRoot.setOrientation(LinearLayout.VERTICAL);
         fullPlayerRoot.setGravity(Gravity.CENTER_HORIZONTAL);
-        fullPlayerRoot.setPadding(dp(24), dp(16), dp(24), dp(20));
+        fullPlayerRoot.setPadding(dp(24), dp(14), dp(24), dp(16));
 
+        // 1. ÜST BAR (Daraltma Butonu + Şarkı | Video/Sıradaki Hapı + 3 Nokta Menü)
         LinearLayout topBar = new LinearLayout(activity);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
-        topBar.setPadding(0, dp(4), 0, dp(12));
+        topBar.setPadding(0, dp(4), 0, dp(10));
 
         ImageButton collapseBtn = new ImageButton(activity);
         collapseBtn.setImageDrawable(createVectorIconDrawable(ICON_CHEVRON_DOWN, Color.WHITE, 0));
@@ -596,10 +877,10 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         songTab.setPadding(dp(18), dp(6), dp(18), dp(6));
         GradientDrawable activeTabBg = new GradientDrawable();
         activeTabBg.setCornerRadius(dp(18));
-        activeTabBg.setColor(Color.argb(75, 255, 255, 255));
+        activeTabBg.setColor(Color.argb(85, 255, 255, 255));
         songTab.setBackground(activeTabBg);
 
-        TextView queueTab = text("Sıradaki", 13, Color.argb(190, 255, 255, 255));
+        TextView queueTab = text("Sıradaki", 13, Color.argb(195, 255, 255, 255));
         queueTab.setPadding(dp(16), dp(6), dp(16), dp(6));
         queueTab.setOnClickListener(v -> showUpNextQueueDialog());
 
@@ -617,20 +898,19 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         topBar.addView(moreBtn, new LinearLayout.LayoutParams(dp(44), dp(44)));
         fullPlayerRoot.addView(topBar, new LinearLayout.LayoutParams(-1, -2));
 
+        // 2. ALBÜM KAPAĞI
         FrameLayout artWrap = new FrameLayout(activity);
-        int artSize = Math.min(dp(330), getResources().getDisplayMetrics().widthPixels - dp(56));
+        int artSize = Math.min(dp(320), getResources().getDisplayMetrics().widthPixels - dp(52));
         fullArtwork = artworkView(null, FULL_ARTWORK_CORNER_DP);
-        fullArtwork.setElevation(dp(12));
+        fullArtwork.setElevation(dp(14));
         artWrap.addView(fullArtwork, new FrameLayout.LayoutParams(artSize, artSize, Gravity.CENTER));
         fullPlayerRoot.addView(artWrap, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        LinearLayout metaRow = new LinearLayout(activity);
-        metaRow.setOrientation(LinearLayout.HORIZONTAL);
-        metaRow.setGravity(Gravity.CENTER_VERTICAL);
-        metaRow.setPadding(dp(4), dp(14), dp(4), dp(12));
+        // 3. ŞARKI ADI VE SANATÇI (Orijinal YT Music Düzeni)
+        LinearLayout metaCol = new LinearLayout(activity);
+        metaCol.setOrientation(LinearLayout.VERTICAL);
+        metaCol.setPadding(dp(4), dp(12), dp(4), dp(10));
 
-        LinearLayout titleCol = new LinearLayout(activity);
-        titleCol.setOrientation(LinearLayout.VERTICAL);
         fullTitle = text("", 22, Color.WHITE);
         fullTitle.setTypeface(Typeface.DEFAULT_BOLD);
         fullTitle.setSingleLine(true);
@@ -638,41 +918,74 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         fullTitle.setMarqueeRepeatLimit(-1);
         fullTitle.setSelected(true);
 
-        fullArtist = text("", 15, Color.argb(185, 255, 255, 255));
+        fullArtist = text("", 15, Color.argb(190, 255, 255, 255));
         fullArtist.setSingleLine(true);
         fullArtist.setEllipsize(TextUtils.TruncateAt.END);
         fullArtist.setPadding(0, dp(3), 0, 0);
 
-        titleCol.addView(fullTitle);
-        titleCol.addView(fullArtist);
-        metaRow.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1));
+        metaCol.addView(fullTitle);
+        metaCol.addView(fullArtist);
+        fullPlayerRoot.addView(metaCol, new LinearLayout.LayoutParams(-1, -2));
 
-        TextView addPlaylistChip = createPillButton("+ Listeye Ekle", false);
-        addPlaylistChip.setTextColor(Color.WHITE);
-        addPlaylistChip.setOnClickListener(v -> {
+        // 4. ORİJİNAL YOUTUBE MUSIC AKSİYON HAPLARI SATIRI (Beğen | Tema | Kaydet | Bilgi)
+        HorizontalScrollView actionsScroll = new HorizontalScrollView(activity);
+        actionsScroll.setHorizontalScrollBarEnabled(false);
+        actionsScroll.setPadding(0, dp(2), 0, dp(12));
+
+        LinearLayout actionsRow = new LinearLayout(activity);
+        actionsRow.setOrientation(LinearLayout.HORIZONTAL);
+        actionsRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView likePill = createYtActionPill("👍 Beğen  |  👎");
+        likePill.setOnClickListener(v -> {
+            likedCurrentTrack = !likedCurrentTrack;
+            likePill.setText(likedCurrentTrack ? "❤️ Beğenildi  |  👎" : "👍 Beğen  |  👎");
             OfflineTrack cur = findByPath(playingPath);
-            if (cur != null) showAddToPlaylistMenu(addPlaylistChip, cur);
+            if (cur != null && likedCurrentTrack) {
+                OfflineStorage.createPlaylist(musicRoot, "Beğendiğim Şarkılar", "LM");
+                OfflineStorage.addTrackToPlaylist(musicRoot, "Beğendiğim Şarkılar", cur.videoId());
+                Utils.showToastShort("Beğendiğim Şarkılar listesine eklendi");
+            }
         });
-        metaRow.addView(addPlaylistChip, new LinearLayout.LayoutParams(-2, -2));
-        fullPlayerRoot.addView(metaRow, new LinearLayout.LayoutParams(-1, -2));
+        actionsRow.addView(likePill);
 
+        themePillText = createYtActionPill("🎨 " + currentTheme.label);
+        themePillText.setOnClickListener(v -> cycleAnimeTheme());
+        actionsRow.addView(themePillText);
+
+        TextView savePill = createYtActionPill("➕ Listeye Kaydet");
+        savePill.setOnClickListener(v -> {
+            OfflineTrack cur = findByPath(playingPath);
+            if (cur != null) showAddToPlaylistMenu(savePill, cur);
+        });
+        actionsRow.addView(savePill);
+
+        TextView infoPill = createYtActionPill("💬 Şarkı Bilgisi");
+        infoPill.setOnClickListener(v -> showCurrentTrackDetailsDialog());
+        actionsRow.addView(infoPill);
+
+        actionsScroll.addView(actionsRow);
+        fullPlayerRoot.addView(actionsScroll, new LinearLayout.LayoutParams(-1, -2));
+
+        // 5. İLERLEME ÇUBUĞU (GARANTİLİ GÖRÜNÜR SEEKBAR VE SÜRELER)
         fullSeek = createFullPlayerSeekBar();
         fullPlayerRoot.addView(fullSeek, new LinearLayout.LayoutParams(-1, dp(SEEK_BAR_TOUCH_DP)));
 
         LinearLayout timeRow = new LinearLayout(activity);
         timeRow.setOrientation(LinearLayout.HORIZONTAL);
-        timeRow.setPadding(dp(6), 0, dp(6), dp(14));
-        fullCurrentTime = text("0:00", 12, Color.argb(180, 255, 255, 255));
-        fullTotalTime = text("0:00", 12, Color.argb(180, 255, 255, 255));
+        timeRow.setPadding(dp(4), 0, dp(4), dp(12));
+        fullCurrentTime = text("0:00", 12, Color.argb(195, 255, 255, 255));
+        fullTotalTime = text("0:00", 12, Color.argb(195, 255, 255, 255));
         fullTotalTime.setGravity(Gravity.END);
         timeRow.addView(fullCurrentTime, new LinearLayout.LayoutParams(0, -2, 1));
         timeRow.addView(fullTotalTime, new LinearLayout.LayoutParams(0, -2, 1));
         fullPlayerRoot.addView(timeRow, new LinearLayout.LayoutParams(-1, -2));
 
+        // 6. KONTROL BUTONLARI (Karıştır, Önceki, Oynat/Duraklat, Sonraki, Tekrarla)
         LinearLayout controlsRow = new LinearLayout(activity);
         controlsRow.setOrientation(LinearLayout.HORIZONTAL);
         controlsRow.setGravity(Gravity.CENTER_VERTICAL);
-        controlsRow.setPadding(0, dp(4), 0, dp(22));
+        controlsRow.setPadding(0, dp(4), 0, dp(18));
 
         fullShuffleBtn = new ImageButton(activity);
         fullShuffleBtn.setBackground(createCircleRipple());
@@ -684,33 +997,24 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         controlsRow.addView(fullShuffleBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         controlsRow.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
 
-        fullPrevBtn = icon("yt_fill_experimental_skip_previous_vd_theme_24", str("morphe_music_downloads_previous"));
-        fullPrevBtn.setColorFilter(Color.WHITE);
-        fullPrevBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        fullPrevBtn.setPadding(dp(8), dp(8), dp(8), dp(8));
+        fullPrevBtn = new ImageButton(activity);
+        fullPrevBtn.setBackground(createCircleRipple());
+        fullPrevBtn.setImageDrawable(createVectorIconDrawable(ICON_SKIP_PREV, Color.WHITE, 0));
         fullPrevBtn.setOnClickListener(v -> OfflinePlaybackService.skipPrevious(activity));
-        controlsRow.addView(fullPrevBtn, new LinearLayout.LayoutParams(dp(52), dp(52)));
+        controlsRow.addView(fullPrevBtn, new LinearLayout.LayoutParams(dp(54), dp(54)));
         controlsRow.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
 
         fullPlayBtn = new ImageButton(activity);
-        GradientDrawable playCircle = new GradientDrawable();
-        playCircle.setShape(GradientDrawable.OVAL);
-        playCircle.setColor(Color.WHITE);
-        fullPlayBtn.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(60, 0, 0, 0)), playCircle, playCircle));
-        fullPlayBtn.setColorFilter(Color.BLACK);
-        fullPlayBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        fullPlayBtn.setPadding(dp(18), dp(18), dp(18), dp(18));
-        fullPlayBtn.setElevation(dp(6));
+        fullPlayBtn.setElevation(dp(8));
         fullPlayBtn.setOnClickListener(v -> OfflinePlaybackService.toggle(activity));
-        controlsRow.addView(fullPlayBtn, new LinearLayout.LayoutParams(dp(68), dp(68)));
+        controlsRow.addView(fullPlayBtn, new LinearLayout.LayoutParams(dp(72), dp(72)));
         controlsRow.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
 
-        fullNextBtn = icon("yt_fill_experimental_skip_next_vd_theme_24", str("morphe_music_downloads_next"));
-        fullNextBtn.setColorFilter(Color.WHITE);
-        fullNextBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        fullNextBtn.setPadding(dp(8), dp(8), dp(8), dp(8));
+        fullNextBtn = new ImageButton(activity);
+        fullNextBtn.setBackground(createCircleRipple());
+        fullNextBtn.setImageDrawable(createVectorIconDrawable(ICON_SKIP_NEXT, Color.WHITE, 0));
         fullNextBtn.setOnClickListener(v -> OfflinePlaybackService.skipNext(activity));
-        controlsRow.addView(fullNextBtn, new LinearLayout.LayoutParams(dp(52), dp(52)));
+        controlsRow.addView(fullNextBtn, new LinearLayout.LayoutParams(dp(54), dp(54)));
         controlsRow.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
 
         fullRepeatBtn = new ImageButton(activity);
@@ -722,24 +1026,32 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         controlsRow.addView(fullRepeatBtn, new LinearLayout.LayoutParams(dp(48), dp(48)));
         fullPlayerRoot.addView(controlsRow, new LinearLayout.LayoutParams(-1, -2));
 
+        // 7. ALT SEKMELER (SIRADAKİ | TEMA GEÇİŞİ | İLGİLİ BİLGİ)
         LinearLayout bottomTabs = new LinearLayout(activity);
         bottomTabs.setOrientation(LinearLayout.HORIZONTAL);
         bottomTabs.setGravity(Gravity.CENTER);
-        bottomTabs.setPadding(0, dp(8), 0, dp(4));
+        bottomTabs.setPadding(0, dp(6), 0, dp(4));
 
-        TextView upNextTab = text("SIRADAKİ", 13, Color.WHITE);
+        TextView upNextTab = text("SIRADAKİ", 12, Color.WHITE);
         upNextTab.setTypeface(Typeface.DEFAULT_BOLD);
         upNextTab.setGravity(Gravity.CENTER);
-        upNextTab.setPadding(dp(16), dp(10), dp(16), dp(10));
+        upNextTab.setPadding(dp(12), dp(10), dp(12), dp(10));
         upNextTab.setOnClickListener(v -> showUpNextQueueDialog());
 
-        TextView detailsTab = text("ŞARKI BİLGİSİ", 13, Color.argb(170, 255, 255, 255));
+        TextView lyricsThemeTab = text("ANİME TEMA", 12, Color.argb(185, 255, 255, 255));
+        lyricsThemeTab.setTypeface(Typeface.DEFAULT_BOLD);
+        lyricsThemeTab.setGravity(Gravity.CENTER);
+        lyricsThemeTab.setPadding(dp(12), dp(10), dp(12), dp(10));
+        lyricsThemeTab.setOnClickListener(v -> cycleAnimeTheme());
+
+        TextView detailsTab = text("İLGİLİ", 12, Color.argb(185, 255, 255, 255));
         detailsTab.setTypeface(Typeface.DEFAULT_BOLD);
         detailsTab.setGravity(Gravity.CENTER);
-        detailsTab.setPadding(dp(16), dp(10), dp(16), dp(10));
+        detailsTab.setPadding(dp(12), dp(10), dp(12), dp(10));
         detailsTab.setOnClickListener(v -> showCurrentTrackDetailsDialog());
 
         bottomTabs.addView(upNextTab, new LinearLayout.LayoutParams(0, -2, 1));
+        bottomTabs.addView(lyricsThemeTab, new LinearLayout.LayoutParams(0, -2, 1));
         bottomTabs.addView(detailsTab, new LinearLayout.LayoutParams(0, -2, 1));
         fullPlayerRoot.addView(bottomTabs, new LinearLayout.LayoutParams(-1, -2));
 
@@ -749,9 +1061,111 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         }
         OfflineTrack current = findByPath(playingPath);
         if (current != null) applyTrackVisuals(current);
-        updateFullShuffleRepeatVisuals();
-        updatePlayIcon(showingPause, false);
+        updateDynamicPlayerColors();
+        updatePlayIcon(showingPause);
         fullPlayerDialog.show();
+    }
+
+    private TextView createYtActionPill(String label) {
+        TextView pill = text(label, 13, Color.WHITE);
+        pill.setTypeface(Typeface.DEFAULT_BOLD);
+        pill.setPadding(dp(16), dp(9), dp(16), dp(9));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(20));
+        bg.setColor(Color.argb(38, 255, 255, 255));
+        bg.setStroke(dp(1), Color.argb(65, 255, 255, 255));
+        pill.setBackground(new RippleDrawable(ColorStateList.valueOf(rippleColor()), bg, bg));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+        lp.setMargins(0, 0, dp(10), 0);
+        pill.setLayoutParams(lp);
+        return pill;
+    }
+
+    /**
+     * Özel Canvas Çizimli İlerleme Çubuğu: Her Android sürümünde arka izi (track)
+     * ve anime temalı renk geçişli (gradient) doluluk çubuğunu %100 görünür çizer.
+     */
+    private Drawable createAnimeProgressDrawable(final int barHeightPx, final boolean rounded) {
+        return new Drawable() {
+            private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+            @Override
+            protected boolean onLevelChange(int level) {
+                invalidateSelf();
+                return true;
+            }
+
+            @Override
+            public void draw(@NonNull Canvas canvas) {
+                Rect b = getBounds();
+                if (b.width() <= 0 || b.height() <= 0) return;
+
+                float cy = b.exactCenterY();
+                float halfH = barHeightPx / 2f;
+                float radius = rounded ? halfH : 0f;
+
+                // 1. Arka Plan İzi (Her zaman net görünür yarı saydam beyaz/gri iz)
+                paint.setShader(null);
+                paint.setColor(Color.argb(85, 255, 255, 255));
+                RectF trackRect = new RectF(b.left, cy - halfH, b.right, cy + halfH);
+                canvas.drawRoundRect(trackRect, radius, radius, paint);
+
+                // 2. Oynatılan Kısım (Evangelion / Cowboy Bebop / Berserk Geçişli)
+                float ratio = Math.max(0f, Math.min(1f, getLevel() / 10000f));
+                float playedRight = b.left + b.width() * ratio;
+                if (playedRight > b.left) {
+                    RectF playedRect = new RectF(b.left, cy - halfH, playedRight, cy + halfH);
+                    paint.setShader(new LinearGradient(
+                            b.left, cy, b.right, cy,
+                            new int[]{activeAccentColor(), activeSecondaryAccent()},
+                            null, Shader.TileMode.CLAMP));
+                    canvas.drawRoundRect(playedRect, radius, radius, paint);
+                }
+            }
+
+            @Override public void setAlpha(int alpha) { paint.setAlpha(alpha); }
+            @Override public void setColorFilter(@Nullable ColorFilter cf) { paint.setColorFilter(cf); }
+            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+        };
+    }
+
+    private SeekBar createFullPlayerSeekBar() {
+        SeekBar seek = new SeekBar(getActivity());
+        seek.setPadding(dp(10), 0, dp(10), 0);
+        seek.setProgressDrawable(createAnimeProgressDrawable(dp(SEEK_BAR_HEIGHT_DP), true));
+
+        Drawable thumb = new Drawable() {
+            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override
+            public void draw(@NonNull Canvas canvas) {
+                float cx = getBounds().exactCenterX();
+                float cy = getBounds().exactCenterY();
+                p.setColor(activeAccentColor());
+                canvas.drawCircle(cx, cy, dp(SEEK_THUMB_DP) / 2f, p);
+                p.setColor(Color.WHITE);
+                canvas.drawCircle(cx, cy, dp(SEEK_THUMB_DP) / 4f, p);
+            }
+            @Override public int getIntrinsicWidth() { return dp(SEEK_THUMB_DP); }
+            @Override public int getIntrinsicHeight() { return dp(SEEK_THUMB_DP); }
+            @Override public void setAlpha(int alpha) { p.setAlpha(alpha); }
+            @Override public void setColorFilter(@Nullable ColorFilter cf) { p.setColorFilter(cf); }
+            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+        };
+        seek.setThumb(thumb);
+        seek.setThumbOffset(dp(SEEK_THUMB_DP) / 2);
+        seek.setBackground(null);
+        seek.setSplitTrack(false);
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onStartTrackingTouch(SeekBar bar) { userSeeking = true; }
+            @Override public void onStopTrackingTouch(SeekBar bar) {
+                userSeeking = false;
+                OfflinePlaybackService.seekTo(bar.getProgress());
+            }
+            @Override public void onProgressChanged(SeekBar bar, int value, boolean fromUser) {
+                if (fromUser && fullCurrentTime != null) fullCurrentTime.setText(formatDuration(value / 1000));
+            }
+        });
+        return seek;
     }
 
     private void showUpNextQueueDialog() {
@@ -763,7 +1177,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         sheet.setPadding(dp(16), dp(18), dp(16), dp(16));
         sheet.setBackground(menuBackground());
 
-        TextView header = text("Sıradaki Şarkılar (" + queue.size() + ")", 17, foreground());
+        TextView header = text("Sıradaki Şarkılar (" + queue.size() + ")", 17, Color.WHITE);
         header.setTypeface(Typeface.DEFAULT_BOLD);
         header.setPadding(dp(8), 0, dp(8), dp(12));
         sheet.addView(header);
@@ -783,12 +1197,15 @@ public final class LocalDownloadsFragment extends PreferenceFragment
             item.setGravity(Gravity.CENTER_VERTICAL);
             item.setPadding(dp(8), dp(8), dp(8), dp(8));
             item.setBackground(rowBackground(i == activeIdx));
-            item.addView(artworkView(t.artwork(128), 4), new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+            ImageView art = artworkView(null, 4);
+            loadArtworkAsync(t, 128, art);
+            item.addView(art, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
             LinearLayout col = new LinearLayout(getActivity());
             col.setOrientation(LinearLayout.VERTICAL);
             col.setPadding(dp(12), 0, dp(8), 0);
-            TextView title = text(t.displayTitle(), 14, foreground());
+            TextView title = text(t.displayTitle(), 14, Color.WHITE);
             if (i == activeIdx) title.setTypeface(Typeface.DEFAULT_BOLD);
             title.setSingleLine(true);
             TextView sub = text(t.displayArtist() + " • " + formatDuration(t.durationSeconds()), 12, secondary());
@@ -810,18 +1227,21 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         if (cur == null) return;
         String info = "Başlık: " + cur.displayTitle() + "\nSanatçı: " + cur.displayArtist()
                 + "\nAlbüm: " + cur.displayAlbum() + "\nSüre: " + formatDuration(cur.durationSeconds())
-                + "\nBoyut: " + formatSize(cur.audioFile().length()) + " MB\nVideo ID: " + cur.videoId();
+                + "\nBoyut: " + formatSize(cur.audioFile().length()) + " MB\nVideo ID: " + cur.videoId()
+                + "\nAktif Tema: " + currentTheme.label;
         CustomDialog.create(getActivity(), "Şarkı Bilgisi", info, null, "Tamam", () -> {}, null, null, null, false).first.show();
     }
 
     private void updateFullShuffleRepeatVisuals() {
+        int accent = activeAccentColor();
         if (fullShuffleBtn != null) {
-            int c = OfflinePlaybackService.isShuffleEnabled() ? Color.WHITE : Color.argb(120, 255, 255, 255);
-            fullShuffleBtn.setImageDrawable(createVectorIconDrawable(ICON_SHUFFLE, c, 0));
+            int c = OfflinePlaybackService.isShuffleEnabled() ? accent : Color.argb(135, 255, 255, 255);
+            fullShuffleBtn.setImageDrawable(createVectorIconDrawable(ICON_SHUFFLE, c,
+                    OfflinePlaybackService.isShuffleEnabled() ? 1 : 0));
         }
         if (fullRepeatBtn != null) {
             int r = OfflinePlaybackService.getRepeatMode();
-            int c = r != OfflinePlaybackService.REPEAT_OFF ? Color.WHITE : Color.argb(120, 255, 255, 255);
+            int c = r != OfflinePlaybackService.REPEAT_OFF ? accent : Color.argb(135, 255, 255, 255);
             fullRepeatBtn.setImageDrawable(createVectorIconDrawable(ICON_REPEAT, c, r));
         }
     }
@@ -833,11 +1253,54 @@ public final class LocalDownloadsFragment extends PreferenceFragment
             public void draw(@NonNull Canvas canvas) {
                 float cx = getBounds().width() / 2f, cy = getBounds().height() / 2f;
                 paint.setColor(color);
-                paint.setStyle(Paint.Style.STROKE);
-                paint.setStrokeWidth(dp(2));
                 paint.setStrokeCap(Paint.Cap.ROUND);
                 paint.setStrokeJoin(Paint.Join.ROUND);
-                if (type == ICON_CHEVRON_DOWN) {
+
+                if (type == ICON_PLAY) {
+                    paint.setStyle(Paint.Style.FILL);
+                    float s = dp(10);
+                    Path p = new Path();
+                    p.moveTo(cx - s * 0.65f, cy - s);
+                    p.lineTo(cx + s * 0.95f, cy);
+                    p.lineTo(cx - s * 0.65f, cy + s);
+                    p.close();
+                    canvas.drawPath(p, paint);
+                } else if (type == ICON_PAUSE) {
+                    paint.setStyle(Paint.Style.FILL);
+                    float w = dp(3.5f), h = dp(10), gap = dp(4.5f);
+                    canvas.drawRoundRect(new RectF(cx - gap - w, cy - h, cx - gap + w, cy + h), dp(2), dp(2), paint);
+                    canvas.drawRoundRect(new RectF(cx + gap - w, cy - h, cx + gap + w, cy + h), dp(2), dp(2), paint);
+                } else if (type == ICON_SKIP_PREV) {
+                    paint.setStyle(Paint.Style.FILL);
+                    float s = dp(8);
+                    canvas.drawRoundRect(new RectF(cx - s, cy - s, cx - s + dp(2.5f), cy + s), dp(1), dp(1), paint);
+                    Path p = new Path();
+                    p.moveTo(cx + s, cy - s);
+                    p.lineTo(cx - s + dp(3), cy);
+                    p.lineTo(cx + s, cy + s);
+                    p.close();
+                    canvas.drawPath(p, paint);
+                } else if (type == ICON_SKIP_NEXT) {
+                    paint.setStyle(Paint.Style.FILL);
+                    float s = dp(8);
+                    canvas.drawRoundRect(new RectF(cx + s - dp(2.5f), cy - s, cx + s, cy + s), dp(1), dp(1), paint);
+                    Path p = new Path();
+                    p.moveTo(cx - s, cy - s);
+                    p.lineTo(cx + s - dp(3), cy);
+                    p.lineTo(cx - s, cy + s);
+                    p.close();
+                    canvas.drawPath(p, paint);
+                } else if (type == ICON_PALETTE) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(2));
+                    canvas.drawCircle(cx, cy, dp(8), paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(cx - dp(3), cy - dp(2), dp(1.6f), paint);
+                    canvas.drawCircle(cx + dp(3), cy - dp(2), dp(1.6f), paint);
+                    canvas.drawCircle(cx, cy + dp(3), dp(1.6f), paint);
+                } else if (type == ICON_CHEVRON_DOWN) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(2.2f));
                     float s = dp(7);
                     Path p = new Path();
                     p.moveTo(cx - s, cy - s / 2f);
@@ -845,6 +1308,8 @@ public final class LocalDownloadsFragment extends PreferenceFragment
                     p.lineTo(cx + s, cy - s / 2f);
                     canvas.drawPath(p, paint);
                 } else if (type == ICON_SHUFFLE) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(2));
                     float s = dp(7);
                     Path p = new Path();
                     p.moveTo(cx - s, cy - s * 0.6f);
@@ -852,11 +1317,13 @@ public final class LocalDownloadsFragment extends PreferenceFragment
                     p.moveTo(cx - s, cy + s * 0.6f);
                     p.lineTo(cx + s, cy - s * 0.6f);
                     canvas.drawPath(p, paint);
-                    if (color == Color.WHITE) {
+                    if (mode != 0) {
                         paint.setStyle(Paint.Style.FILL);
-                        canvas.drawCircle(cx, cy + dp(12), dp(2), paint);
+                        canvas.drawCircle(cx, cy + dp(11), dp(2.2f), paint);
                     }
                 } else if (type == ICON_REPEAT) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(2));
                     float r = dp(7);
                     canvas.drawRoundRect(new RectF(cx - r, cy - r * 0.7f, cx + r, cy + r * 0.7f), dp(4), dp(4), paint);
                     if (mode == OfflinePlaybackService.REPEAT_ONE) {
@@ -868,7 +1335,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
                     }
                     if (mode != OfflinePlaybackService.REPEAT_OFF) {
                         paint.setStyle(Paint.Style.FILL);
-                        canvas.drawCircle(cx, cy + dp(12), dp(2), paint);
+                        canvas.drawCircle(cx, cy + dp(11), dp(2.2f), paint);
                     }
                 }
             }
@@ -879,57 +1346,26 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     private Drawable createCircleRipple() {
-        return new RippleDrawable(ColorStateList.valueOf(Color.argb(60, 255, 255, 255)), null, new ShapeDrawable(new OvalShape()));
+        return new RippleDrawable(ColorStateList.valueOf(Color.argb(65, 255, 255, 255)), null, new ShapeDrawable(new OvalShape()));
     }
 
     private TextView createPillButton(String label, boolean active) {
-        TextView view = text(label, 12, active ? background() : foreground());
+        int accent = activeAccentColor();
+        TextView view = text(label, 12, active ? currentTheme.playIconDark : Color.WHITE);
         view.setTypeface(Typeface.DEFAULT_BOLD);
         view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(12), dp(7), dp(12), dp(7));
+        view.setPadding(dp(14), dp(8), dp(14), dp(8));
         GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(16));
-        if (active) bg.setColor(foreground());
-        else {
-            bg.setColor(Color.argb(35, 255, 255, 255));
-            bg.setStroke(dp(1), Color.argb(80, 255, 255, 255));
+        bg.setCornerRadius(dp(18));
+        if (active) {
+            bg.setColors(new int[]{accent, activeSecondaryAccent()});
+            bg.setOrientation(GradientDrawable.Orientation.LEFT_RIGHT);
+        } else {
+            bg.setColor(Color.argb(40, 255, 255, 255));
+            bg.setStroke(dp(1), Color.argb(95, 255, 255, 255));
         }
         view.setBackground(new RippleDrawable(ColorStateList.valueOf(rippleColor()), bg, bg));
         return view;
-    }
-
-    private SeekBar createFullPlayerSeekBar() {
-        SeekBar seek = new SeekBar(getActivity());
-        seek.setPadding(dp(6), 0, dp(6), 0);
-        Drawable track = CustomDialog.createRoundedBackground(SEEK_BAR_HEIGHT_DP, Color.argb(70, 255, 255, 255));
-        Drawable played = CustomDialog.createRoundedBackground(SEEK_BAR_HEIGHT_DP, Color.WHITE);
-        LayerDrawable layers = new LayerDrawable(new Drawable[]{track, new ClipDrawable(played, Gravity.START, ClipDrawable.HORIZONTAL)});
-        layers.setId(0, android.R.id.background);
-        layers.setId(1, android.R.id.progress);
-        int inset = (dp(SEEK_BAR_TOUCH_DP) - dp(SEEK_BAR_HEIGHT_DP)) / 2;
-        layers.setLayerInset(0, 0, inset, 0, inset);
-        layers.setLayerInset(1, 0, inset, 0, inset);
-        seek.setProgressDrawable(layers);
-
-        ShapeDrawable thumb = new ShapeDrawable(new OvalShape());
-        thumb.setIntrinsicWidth(dp(SEEK_THUMB_DP));
-        thumb.setIntrinsicHeight(dp(SEEK_THUMB_DP));
-        thumb.getPaint().setColor(Color.WHITE);
-        seek.setThumb(thumb);
-        seek.setThumbOffset(dp(SEEK_THUMB_DP) / 2);
-        seek.setBackground(null);
-        seek.setSplitTrack(false);
-        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onStartTrackingTouch(SeekBar bar) { userSeeking = true; }
-            @Override public void onStopTrackingTouch(SeekBar bar) {
-                userSeeking = false;
-                OfflinePlaybackService.seekTo(bar.getProgress());
-            }
-            @Override public void onProgressChanged(SeekBar bar, int value, boolean fromUser) {
-                if (fromUser && fullCurrentTime != null) fullCurrentTime.setText(formatDuration(value / 1000));
-            }
-        });
-        return seek;
     }
 
     private void showTrackMenu(View anchor, OfflineTrack track) {
@@ -987,7 +1423,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         popup.setAdapter(new ArrayAdapter<>(getActivity(), 0, items) {
             @NonNull @Override
             public View getView(int pos, @Nullable View convertView, @NonNull ViewGroup parent) {
-                TextView v = text(getItem(pos), 15, selected < 0 || pos == selected ? foreground() : secondary());
+                TextView v = text(getItem(pos), 15, selected < 0 || pos == selected ? Color.WHITE : secondary());
                 v.setPadding(dp(20), dp(14), dp(20), dp(14));
                 return v;
             }
@@ -997,10 +1433,10 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     private Drawable menuBackground() {
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(ThemeUtils.getDialogBackgroundColor());
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{currentTheme.gradMid, currentTheme.gradBottom});
         bg.setCornerRadius(dp(MENU_CORNER_DP));
-        bg.setStroke(dp(1), rippleColor());
+        bg.setStroke(dp(1), activeAccentColor());
         return bg;
     }
 
@@ -1025,6 +1461,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
             deleteSidecars(t.videoId());
             OfflineStorage.removeTrackFromAllPlaylists(musicRoot, t.videoId());
         }
+        ARTWORK_CACHE.evictAll();
         showTracks();
         Utils.showToastShort(str("morphe_music_downloads_all_deleted"));
     }
@@ -1073,11 +1510,11 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         if (getActivity() == null) return;
         getActivity().runOnUiThread(() -> {
             if (miniPlayer == null) return;
-            boolean wasVisible = miniPlayer.getVisibility() == View.VISIBLE;
             miniPlayer.setVisibility(title.isEmpty() ? View.GONE : View.VISIBLE);
 
             if (!path.equals(playingPath)) {
                 playingPath = path;
+                likedCurrentTrack = false;
                 OfflineTrack t = findByPath(path);
                 if (t != null) applyTrackVisuals(t);
                 else {
@@ -1087,7 +1524,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
                 markPlayingRow();
             }
             updateFullShuffleRepeatVisuals();
-            updatePlayIcon(playing, wasVisible && playing != showingPause);
+            updatePlayIcon(playing);
 
             int safeDur = Math.max(1, duration);
             if (miniProgressBar != null) {
@@ -1103,76 +1540,49 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         });
     }
 
-    private void updatePlayIcon(boolean playing, boolean morph) {
+    private void updatePlayIcon(boolean playing) {
         showingPause = playing;
-        Drawable iconDrawable = ResourceUtils.getDrawable(playing
-                ? "yt_fill_experimental_pause_vd_theme_24" : "yt_fill_experimental_play_vd_theme_24");
+        int iconType = playing ? ICON_PAUSE : ICON_PLAY;
         if (fullPlayBtn != null) {
-            fullPlayBtn.setImageDrawable(iconDrawable);
-            fullPlayBtn.setColorFilter(Color.BLACK);
+            GradientDrawable playCircle = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    new int[]{activeAccentColor(), activeSecondaryAccent()});
+            playCircle.setShape(GradientDrawable.OVAL);
+            fullPlayBtn.setBackground(new RippleDrawable(
+                    ColorStateList.valueOf(Color.argb(90, 255, 255, 255)), playCircle, playCircle));
+            fullPlayBtn.setImageDrawable(createVectorIconDrawable(iconType, currentTheme.playIconDark, 0));
         }
-        if (morph && startIconMorph(playing)) return;
         if (miniPlay != null) {
-            miniPlay.setImageDrawable(iconDrawable);
-            miniPlay.setColorFilter(Color.WHITE);
+            miniPlay.setImageDrawable(createVectorIconDrawable(iconType, activeAccentColor(), 0));
         }
-    }
-
-    private boolean startIconMorph(boolean playing) {
-        String name = playing ? "player_play_pause_vector_transition" : "player_pause_play_vector_transition";
-        int id = ResourceUtils.getDrawableIdentifier(name + "_delhi");
-        if (id == 0) id = ResourceUtils.getDrawableIdentifier(name);
-        Activity act = getActivity();
-        if (id == 0 || act == null) return false;
-        Drawable d = act.getDrawable(id);
-        if (!(d instanceof AnimatedVectorDrawable morph)) return false;
-        miniPlay.setImageDrawable(morph);
-        miniPlay.setColorFilter(Color.WHITE);
-        morph.start();
-        return true;
     }
 
     private void applyTrackVisuals(OfflineTrack track) {
         miniTitle.setText(track.displayTitle());
         miniArtist.setText(track.displayArtist());
-        Bitmap small = track.artwork(ROW_ARTWORK_PIXELS);
-        if (small != null) {
-            miniArtwork.clearColorFilter();
-            miniArtwork.setPadding(0, 0, 0, 0);
-            miniArtwork.setImageBitmap(small);
-            miniArtwork.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        }
+        loadArtworkAsync(track, ROW_ARTWORK_PIXELS, miniArtwork);
+
         if (fullTitle != null) {
             fullTitle.setText(track.displayTitle());
             fullArtist.setText(track.displayArtist());
         }
         if (fullArtwork != null) {
-            Bitmap large = track.artwork(FULL_ARTWORK_PIXELS);
-            if (large != null) {
-                fullArtwork.clearColorFilter();
-                fullArtwork.setPadding(0, 0, 0, 0);
-                fullArtwork.setImageBitmap(large);
-                fullArtwork.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            }
+            loadArtworkAsync(track, FULL_ARTWORK_PIXELS, fullArtwork);
         }
         if (fullPlayerRoot != null) {
-            int dom = track.extractDominantColor(Color.parseColor("#282828"));
-            fullPlayerRoot.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                    new int[]{dom, Color.parseColor("#0D0D0D"), Color.parseColor("#050505")}));
+            fullPlayerRoot.setBackground(buildAnimeBackgroundGradient(track));
         }
     }
 
     private ImageView artworkView(@Nullable Bitmap bmp, int cornerDp) {
         ImageView v = new ImageView(getActivity());
-        v.setBackgroundColor(artworkPlaceholder());
+        v.setBackgroundColor(Color.argb(45, 255, 255, 255));
         roundCorners(v, cornerDp);
         if (bmp != null) {
             v.setImageBitmap(bmp);
             v.setScaleType(ImageView.ScaleType.CENTER_CROP);
         } else {
-            v.setImageDrawable(ResourceUtils.getDrawable("yt_fill_experimental_play_circle_vd_theme_24"));
-            v.setColorFilter(foreground());
-            v.setPadding(dp(14), dp(14), dp(14), dp(14));
+            v.setImageDrawable(createVectorIconDrawable(ICON_PLAY, activeAccentColor(), 0));
+            v.setPadding(dp(12), dp(12), dp(12), dp(12));
         }
         return v;
     }
@@ -1198,7 +1608,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
 
     private ImageButton icon(String drawable, String desc) {
         ImageButton b = icon(ResourceUtils.getDrawable(drawable), desc);
-        b.setColorFilter(foreground());
+        b.setColorFilter(Color.WHITE);
         return b;
     }
 
@@ -1212,10 +1622,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         return b;
     }
 
-    private static int foreground() { return ThemeUtils.getAppForegroundColor(); }
-    private static int secondary() { return Utils.adjustColorBrightness(foreground(), SECONDARY_DIM); }
-    private static int background() { return ThemeUtils.getAppBackgroundColor(); }
-    private static int artworkPlaceholder() { return Utils.adjustColorBrightness(foreground(), 0.2f); }
+    private static int secondary() { return Color.argb(180, 230, 230, 240); }
     private int dp(int val) { return (int) (val * getResources().getDisplayMetrics().density + .5f); }
 
     private static String formatDuration(int s) {
@@ -1226,4 +1633,3 @@ public final class LocalDownloadsFragment extends PreferenceFragment
 
     private static String formatSize(long b) { return String.format(Locale.ROOT, "%.1f", b / 1048576.0); }
 }
-// === DOSYA SONU ===

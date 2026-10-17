@@ -17,6 +17,7 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.Environment;
+import android.webkit.CookieManager;
 
 import androidx.annotation.Nullable;
 
@@ -25,13 +26,16 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -55,7 +59,7 @@ import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.VideoDetai
 import app.morphe.extension.shared.requests.Requester;
 import app.morphe.extension.shared.spoof.requests.StreamingDataRequest;
 
-/** Downloads resolved InnerTube audio streams and auto-downloads entire playlists. */
+/** Downloads resolved InnerTube audio streams and auto-downloads entire playlists (including Liked Music). */
 public final class LocalDownloadManager {
 
     public interface DownloadListener {
@@ -64,6 +68,7 @@ public final class LocalDownloadManager {
 
     private static final Set<DownloadListener> LISTENERS = new CopyOnWriteArraySet<>();
     private static final ExecutorService PLAYLIST_QUEUE_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final ExecutorService SEGMENT_POOL = Executors.newFixedThreadPool(8);
 
     private static final String DOWNLOAD_CHANNEL = "morphe_audio_downloads";
     private static final String USER_AGENT =
@@ -74,17 +79,21 @@ public final class LocalDownloadManager {
     private static final int SEGMENT_COUNT = 4;
     private static final int BUFFER_SIZE = 64 * 1024;
 
-    private static final long NOTIFICATION_INTERVAL_MILLISECONDS = 1000;
+    private static final long NOTIFICATION_INTERVAL_MILLISECONDS = 900;
     private static final AtomicLong lastNotificationTime = new AtomicLong();
 
     private static final int CONNECT_TIMEOUT_MILLISECONDS = 15_000;
     private static final int READ_TIMEOUT_MILLISECONDS = 30_000;
     private static final int MAX_STALLED_ATTEMPTS = 4;
+    private static final int MAX_CONTINUATION_PAGES = 15;
 
     private static final Pattern VIDEO_ID = Pattern.compile("[A-Za-z0-9_-]{1,20}");
     private static final Pattern PLAYLIST_PARAM = Pattern.compile("[?&]list=([A-Za-z0-9_-]+)");
-    private static final Pattern JSON_VIDEO_ID = Pattern.compile("\"videoId\":\"([A-Za-z0-9_-]{11})\"");
-    private static final Pattern DIRECT_VIDEO_ID = Pattern.compile("(?:v=|youtu\\.be/|/watch\\?v=)([A-Za-z0-9_-]{11})");
+    private static final Pattern BROWSE_PLAYLIST = Pattern.compile("(?:/playlist/|/browse/)(VL[A-Za-z0-9_-]+|PL[A-Za-z0-9_-]+|OLAK[A-Za-z0-9_-]+|LM|LL)");
+    private static final Pattern JSON_VIDEO_ID = Pattern.compile("\"videoId\"\\s*:\\s*\"([A-Za-z0-9_-]{11})\"");
+    private static final Pattern CONTINUATION_TOKEN = Pattern.compile("\"continuation\"\\s*:\\s*\"([A-Za-z0-9_%=-]{16,})\"");
+    private static final Pattern DIRECT_VIDEO_ID = Pattern.compile("(?:v=|youtu\\.be/|/watch\\?v=|/shorts/)([A-Za-z0-9_-]{11})");
+    private static final Pattern SAPISID_PATTERN = Pattern.compile("(?:^|;\\s*)(?:__Secure-3PAPISID|SAPISID)=([^;]+)");
 
     private static final String THUMBNAIL_URL = "https://i.ytimg.com/vi/";
 
@@ -115,7 +124,6 @@ public final class LocalDownloadManager {
         }
     }
 
-    /** Must be called from the main thread. Resolution and downloading happen in background. */
     public static void enqueue(String videoId) {
         enqueue(videoId, null, true);
     }
@@ -142,9 +150,6 @@ public final class LocalDownloadManager {
         });
     }
 
-    /**
-     * Automatically checks all playlists (or a specific playlist) and downloads any missing tracks.
-     */
     public static void syncPlaylists(File musicRoot, @Nullable String playlistName, boolean notifyStart) {
         PLAYLIST_QUEUE_EXECUTOR.submit(() -> {
             List<String> missing = OfflineStorage.getMissingVideoIds(musicRoot, playlistName);
@@ -167,17 +172,13 @@ public final class LocalDownloadManager {
         });
     }
 
-    /**
-     * Resolves all songs from a YouTube / YouTube Music playlist URL or ID (or list of links)
-     * and automatically downloads every track into the given local playlist.
-     */
     public static void fetchAndDownloadPlaylist(File musicRoot, String playlistName, String rawInput) {
         PLAYLIST_QUEUE_EXECUTOR.submit(() -> {
             try {
                 List<String> resolvedIds = resolvePlaylistOrTrackIds(rawInput);
                 if (resolvedIds.isEmpty()) {
                     Utils.runOnMainThread(() -> Utils.showToastShort(
-                            "Bağlantıdan şarkı bulunamadı. Geçerli bir Playlist linki/ID girin."));
+                            "Şarkı bulunamadı. Beğenilenler (LM) veya gizli listeler için listeyi 'Liste Dışı' yapın ya da şarkı linklerini yapıştırın."));
                     return;
                 }
 
@@ -186,7 +187,7 @@ public final class LocalDownloadManager {
                 notifyListeners("", false);
 
                 Utils.runOnMainThread(() -> Utils.showToastShort(
-                        "\"" + playlistName + "\" listesinde " + resolvedIds.size() + " şarkı bulundu, otomatik indiriliyor..."));
+                        "\"" + playlistName + "\" listesinde " + resolvedIds.size() + " şarkı bulundu, indiriliyor..."));
 
                 int count = 0;
                 for (String id : resolvedIds) {
@@ -220,53 +221,47 @@ public final class LocalDownloadManager {
 
         String trimmed = input.trim();
 
-        // 1. Check if it contains a playlist ID (list=... or starts with PL / VL / OLAK / RD)
-        String listId = null;
-        Matcher listMatcher = PLAYLIST_PARAM.matcher(trimmed);
-        if (listMatcher.find()) {
-            listId = listMatcher.group(1);
-        } else if (trimmed.startsWith("VLPL") && trimmed.length() > 4) {
-            listId = trimmed.substring(2);
-        } else if ((trimmed.startsWith("PL") || trimmed.startsWith("OLAK") || trimmed.startsWith("RD"))
-                && !trimmed.contains(" ") && trimmed.length() >= 10) {
-            listId = trimmed;
-        }
-
-        if (listId != null) {
-            try {
-                String url = "https://www.youtube.com/playlist?list=" + listId + "&hl=en";
-                HttpURLConnection conn = Requester.openConnection(url);
-                conn.setConnectTimeout(CONNECT_TIMEOUT_MILLISECONDS);
-                conn.setReadTimeout(READ_TIMEOUT_MILLISECONDS);
-                conn.setRequestProperty("User-Agent", WEB_USER_AGENT);
-                conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-
-                try (InputStream in = conn.getInputStream()) {
-                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                    byte[] chunk = new byte[16384];
-                    int read;
-                    while ((read = in.read(chunk)) != -1) {
-                        buffer.write(chunk, 0, read);
-                    }
-                    String html = buffer.toString(StandardCharsets.UTF_8.name());
-                    Matcher m = JSON_VIDEO_ID.matcher(html);
-                    while (m.find()) {
-                        ids.add(m.group(1));
-                    }
-                } finally {
-                    conn.disconnect();
-                }
-            } catch (Exception ex) {
-                Logger.printException(() -> "Could not fetch remote playlist page", ex);
-            }
-        }
-
-        // 2. Also support direct video URLs or space/comma/newline-separated 11-char video IDs
+        // 1. Doğrudan video linklerini öncelikle ayıkla (watch?v=...&list=LM gibi durumlarda videoyu kaçırmamak için)
         Matcher directMatcher = DIRECT_VIDEO_ID.matcher(trimmed);
         while (directMatcher.find()) {
             ids.add(directMatcher.group(1));
         }
 
+        // 2. Playlist ID tespiti (LM, VLLM, LL, VLLL, FEmusic_liked_videos, PL..., OLAK..., RD...)
+        String listId = extractPlaylistId(trimmed);
+
+        if (listId != null) {
+            boolean isLikedList = listId.equalsIgnoreCase("LM")
+                    || listId.equalsIgnoreCase("VLLM")
+                    || listId.equalsIgnoreCase("LL")
+                    || listId.equalsIgnoreCase("VLLL")
+                    || listId.equalsIgnoreCase("FEmusic_liked_videos");
+
+            // A) InnerTube Browse & Next API üzerinden çözümle (sayfalama ve oturum çerezi destekli)
+            if (isLikedList) {
+                fetchInnerTubeBrowseIds("VLLM", ids);
+                fetchInnerTubeBrowseIds("FEmusic_liked_videos", ids);
+                fetchInnerTubeBrowseIds("VLLL", ids);
+                fetchRemotePlaylistWebPage("LL", true, ids);
+                fetchRemotePlaylistWebPage("LM", true, ids);
+            } else {
+                String browseId = listId.startsWith("VL") ? listId : "VL" + listId;
+                fetchInnerTubeBrowseIds(browseId, ids);
+                if (ids.isEmpty()) {
+                    fetchRemotePlaylistWebPage(listId, false, ids);
+                }
+            }
+
+            // Eğer o an çalan şarkı varsa ve LM boş döndüyse en azından aktif parçayı yakala
+            if (ids.isEmpty() && isLikedList) {
+                String activeId = VideoInformation.getVideoId();
+                if (activeId != null && activeId.matches("[A-Za-z0-9_-]{11}")) {
+                    ids.add(activeId);
+                }
+            }
+        }
+
+        // 3. Boşluk, virgül veya satır sonu ile ayrılmış 11 karakterli ID'ler
         if (ids.isEmpty()) {
             String[] tokens = trimmed.split("[\\s,;]+");
             for (String token : tokens) {
@@ -277,6 +272,164 @@ public final class LocalDownloadManager {
         }
 
         return new ArrayList<>(ids);
+    }
+
+    @Nullable
+    private static String extractPlaylistId(String trimmed) {
+        Matcher listMatcher = PLAYLIST_PARAM.matcher(trimmed);
+        if (listMatcher.find()) {
+            String raw = listMatcher.group(1);
+            return raw != null && raw.startsWith("VL") && raw.length() > 4 ? raw.substring(2) : raw;
+        }
+        Matcher browseMatcher = BROWSE_PLAYLIST.matcher(trimmed);
+        if (browseMatcher.find()) {
+            String raw = browseMatcher.group(1);
+            return raw != null && raw.startsWith("VL") && raw.length() > 4 ? raw.substring(2) : raw;
+        }
+        String upper = trimmed.toUpperCase(Locale.ROOT);
+        if (upper.equals("LM") || upper.equals("VLLM") || upper.equals("LL")
+                || upper.equals("VLLL") || upper.equals("FEMUSIC_LIKED_VIDEOS")) {
+            return upper;
+        }
+        if (trimmed.startsWith("VL") && trimmed.length() > 4 && !trimmed.contains(" ")) {
+            return trimmed.substring(2);
+        }
+        if ((trimmed.startsWith("PL") || trimmed.startsWith("OLAK") || trimmed.startsWith("RD") || trimmed.startsWith("UU") || trimmed.startsWith("FL"))
+                && !trimmed.contains(" ") && trimmed.length() >= 6) {
+            return trimmed;
+        }
+        return null;
+    }
+
+    private static void fetchInnerTubeBrowseIds(String browseId, Set<String> outIds) {
+        try {
+            String continuation = null;
+            for (int page = 0; page < MAX_CONTINUATION_PAGES; page++) {
+                String endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
+                String payload;
+                if (page == 0) {
+                    payload = "{\"context\":{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20260101.01.00\",\"hl\":\"tr\",\"gl\":\"TR\"}},\"browseId\":\"" + browseId + "\"}";
+                } else {
+                    if (continuation == null || continuation.isEmpty()) break;
+                    payload = "{\"context\":{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20260101.01.00\",\"hl\":\"tr\",\"gl\":\"TR\"}},\"continuation\":\"" + continuation + "\"}";
+                }
+
+                String response = postInnerTubeJson(endpoint, payload);
+                if (response == null || response.isEmpty()) break;
+
+                int beforeCount = outIds.size();
+                Matcher m = JSON_VIDEO_ID.matcher(response);
+                while (m.find()) {
+                    outIds.add(m.group(1));
+                }
+
+                Matcher contMatcher = CONTINUATION_TOKEN.matcher(response);
+                String nextToken = null;
+                while (contMatcher.find()) {
+                    String candidate = contMatcher.group(1);
+                    if (!candidate.equals(continuation)) {
+                        nextToken = candidate;
+                        break;
+                    }
+                }
+                if (nextToken == null || outIds.size() == beforeCount) break;
+                continuation = nextToken;
+            }
+        } catch (Exception ex) {
+            Logger.printDebug(() -> "InnerTube browse resolution fallback: " + browseId, ex);
+        }
+    }
+
+    @Nullable
+    private static String postInnerTubeJson(String url, String jsonPayload) {
+        HttpURLConnection conn = null;
+        try {
+            conn = Requester.openConnection(url);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MILLISECONDS);
+            conn.setReadTimeout(READ_TIMEOUT_MILLISECONDS);
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            conn.setRequestProperty("User-Agent", WEB_USER_AGENT);
+            conn.setRequestProperty("Origin", "https://music.youtube.com");
+            conn.setRequestProperty("Referer", "https://music.youtube.com/");
+            conn.setRequestProperty("X-YouTube-Client-Name", "67");
+            conn.setRequestProperty("X-YouTube-Client-Version", "1.20260101.01.00");
+
+            applySessionCookiesAndAuth(conn, "https://music.youtube.com");
+
+            byte[] body = jsonPayload.getBytes(StandardCharsets.UTF_8);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body);
+            }
+
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
+            return readStreamToString(conn.getInputStream());
+        } catch (Exception ex) {
+            Logger.printDebug(() -> "postInnerTubeJson failed", ex);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static void fetchRemotePlaylistWebPage(String listId, boolean musicDomain, Set<String> ids) {
+        HttpURLConnection conn = null;
+        try {
+            String base = musicDomain ? "https://music.youtube.com/playlist?list=" : "https://www.youtube.com/playlist?list=";
+            conn = Requester.openConnection(base + listId + "&hl=en");
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MILLISECONDS);
+            conn.setReadTimeout(READ_TIMEOUT_MILLISECONDS);
+            conn.setRequestProperty("User-Agent", WEB_USER_AGENT);
+            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+            applySessionCookiesAndAuth(conn, musicDomain ? "https://music.youtube.com" : "https://www.youtube.com");
+
+            String html = readStreamToString(conn.getInputStream());
+            Matcher m = JSON_VIDEO_ID.matcher(html);
+            while (m.find()) {
+                ids.add(m.group(1));
+            }
+        } catch (Exception ex) {
+            Logger.printDebug(() -> "Could not fetch remote playlist page: " + listId, ex);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static void applySessionCookiesAndAuth(HttpURLConnection conn, String origin) {
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            if (cm == null) return;
+            String cookies = cm.getCookie(origin);
+            if (cookies == null || cookies.isBlank()) {
+                cookies = cm.getCookie("https://www.youtube.com");
+            }
+            if (cookies != null && !cookies.isBlank()) {
+                conn.setRequestProperty("Cookie", cookies);
+                Matcher sapisid = SAPISID_PATTERN.matcher(cookies);
+                if (sapisid.find()) {
+                    long timestamp = System.currentTimeMillis() / 1000L;
+                    String raw = timestamp + " " + sapisid.group(1) + " " + origin;
+                    MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+                    byte[] digest = sha1.digest(raw.getBytes(StandardCharsets.UTF_8));
+                    StringBuilder hex = new StringBuilder();
+                    for (byte b : digest) hex.append(String.format(Locale.ROOT, "%02x", b));
+                    conn.setRequestProperty("Authorization", "SAPISIDHASH " + timestamp + "_" + hex);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String readStreamToString(InputStream in) throws IOException {
+        try (InputStream input = in; ByteArrayOutputStream buffer = new ByteArrayOutputStream(32768)) {
+            byte[] chunk = new byte[16384];
+            int read;
+            while ((read = input.read(chunk)) != -1) {
+                buffer.write(chunk, 0, read);
+            }
+            return buffer.toString(StandardCharsets.UTF_8.name());
+        }
     }
 
     private static void downloadBlocking(String videoId, @Nullable String title, @Nullable String artist,
@@ -461,32 +614,25 @@ public final class LocalDownloadManager {
         AtomicLong downloaded = new AtomicLong();
         long segmentSize = (totalLength + SEGMENT_COUNT - 1) / SEGMENT_COUNT;
 
-        //noinspection resource
-        ExecutorService executor = Executors.newFixedThreadPool(SEGMENT_COUNT);
-        List<Future<?>> futures = new ArrayList<>();
+        List<Future<?>> futures = new ArrayList<>(SEGMENT_COUNT);
+        for (int index = 0; index < SEGMENT_COUNT; index++) {
+            long start = index * segmentSize;
+            long end = Math.min(totalLength - 1, start + segmentSize - 1);
+            if (start > end) continue;
 
-        try {
-            for (int index = 0; index < SEGMENT_COUNT; index++) {
-                long start = index * segmentSize;
-                long end = Math.min(totalLength - 1, start + segmentSize - 1);
-                if (start > end) continue;
+            futures.add(SEGMENT_POOL.submit(() -> {
+                downloadRange(url, temporary, start, end, downloaded, bytes -> {
+                    if (!canPostProgress()) return;
+                    int progress = (int) Math.min(99, bytes * 100 / totalLength);
+                    showDownloadNotification(videoId, title, progress, true,
+                            str("morphe_music_downloads_progress", progress));
+                });
+                return null;
+            }));
+        }
 
-                futures.add(executor.submit(() -> {
-                    downloadRange(url, temporary, start, end, downloaded, bytes -> {
-                        if (!canPostProgress()) return;
-                        int progress = (int) Math.min(99, bytes * 100 / totalLength);
-                        showDownloadNotification(videoId, title, progress, true,
-                                str("morphe_music_downloads_progress", progress));
-                    });
-                    return null;
-                }));
-            }
-
-            for (Future<?> future : futures) {
-                future.get();
-            }
-        } finally {
-            executor.shutdownNow();
+        for (Future<?> future : futures) {
+            future.get();
         }
     }
 
@@ -498,41 +644,41 @@ public final class LocalDownloadManager {
                                       AtomicLong downloaded, ProgressCallback progress) throws Exception {
         long position = start;
         int failures = 0;
+        byte[] buffer = new byte[BUFFER_SIZE];
 
-        while (position <= end) {
-            long before = position;
-            HttpURLConnection connection = openAudioConnection(url, position, end);
+        try (RandomAccessFile output = new RandomAccessFile(destination, "rw")) {
+            while (position <= end) {
+                long before = position;
+                HttpURLConnection connection = openAudioConnection(url, position, end);
 
-            try {
-                if (connection.getResponseCode() != HttpURLConnection.HTTP_PARTIAL) {
-                    throw new IllegalStateException(
-                            "Range request returned HTTP " + connection.getResponseCode());
-                }
-
-                try (InputStream input = connection.getInputStream();
-                     RandomAccessFile output = new RandomAccessFile(destination, "rw")) {
-                    output.seek(position);
-                    byte[] buffer = new byte[BUFFER_SIZE];
-
-                    while (position <= end) {
-                        int read = input.read(buffer, 0,
-                                (int) Math.min(buffer.length, end - position + 1));
-                        if (read < 0) break;
-
-                        output.write(buffer, 0, read);
-                        position += read;
-                        progress.update(downloaded.addAndGet(read));
+                try {
+                    if (connection.getResponseCode() != HttpURLConnection.HTTP_PARTIAL) {
+                        throw new IllegalStateException(
+                                "Range request returned HTTP " + connection.getResponseCode());
                     }
-                }
-            } catch (IOException ex) {
-                Logger.printDebug(() -> "Audio range interrupted; retrying", ex);
-            } finally {
-                connection.disconnect();
-            }
 
-            failures = position > before ? 0 : failures + 1;
-            if (failures >= MAX_STALLED_ATTEMPTS) {
-                throw new IllegalStateException("Download range stalled at " + position);
+                    try (InputStream input = connection.getInputStream()) {
+                        output.seek(position);
+                        while (position <= end) {
+                            int read = input.read(buffer, 0,
+                                    (int) Math.min(buffer.length, end - position + 1));
+                            if (read < 0) break;
+
+                            output.write(buffer, 0, read);
+                            position += read;
+                            progress.update(downloaded.addAndGet(read));
+                        }
+                    }
+                } catch (IOException ex) {
+                    Logger.printDebug(() -> "Audio range interrupted; retrying", ex);
+                } finally {
+                    connection.disconnect();
+                }
+
+                failures = position > before ? 0 : failures + 1;
+                if (failures >= MAX_STALLED_ATTEMPTS) {
+                    throw new IllegalStateException("Download range stalled at " + position);
+                }
             }
         }
     }
